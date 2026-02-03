@@ -42,8 +42,11 @@ env/
 *.hdf5
 data/h5/
 
-# Keep CSV metadata but ignore large source CSVs if needed
-# data/*.csv
+# Large CSV files tracked by Git LFS
+# data/chexpert_train.csv
+# data/chexpert_impressions.csv
+# data/rexgradient_all.csv
+# data/rexgradient_impressions.csv
 
 # Slurm outputs
 *.out
