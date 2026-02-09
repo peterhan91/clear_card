@@ -24,6 +24,38 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from data_process import img_to_hdf5, img_to_hdf5_parallel
 
+# Path remapping for ReXGradient (CSV has paths from HuggingFace cache)
+REXGRADIENT_OLD_PREFIX = "/home/than/.cache/huggingface/hub/datasets--rajpurkarlab--ReXGradient-160K/snapshots/e0c7dd5940c6e5f77aac20eea3ff93825d7f8ff3/images"
+REXGRADIENT_NEW_PREFIX = "/cbica/projects/CXR/data/RexGradient/data/images"
+
+
+def fix_chexpert_path(path: str, image_root: str) -> str:
+    """Fix CheXpert path: join with image_root and convert .jpg to .png.
+
+    Also handles the CheXpert-v1.0/ prefix in valid/test CSVs:
+    - Train CSV: 'train/patient.../...'
+    - Valid CSV: 'CheXpert-v1.0/valid/patient.../...'
+    - Test CSV: 'CheXpert-v1.0/test/patient.../...'
+
+    Disk structure is: {image_root}/train/... or {image_root}/valid/... or {image_root}/test/...
+    """
+    # Strip CheXpert-v1.0/ prefix if present (valid/test CSVs have this)
+    if path.startswith('CheXpert-v1.0/'):
+        path = path[len('CheXpert-v1.0/'):]
+
+    full_path = os.path.join(image_root, path)
+    # CSV has .jpg but actual files are .png
+    if full_path.endswith('.jpg'):
+        full_path = full_path[:-4] + '.png'
+    return full_path
+
+
+def fix_rexgradient_path(path: str) -> str:
+    """Fix ReXGradient path: remap from HuggingFace cache to CBICA location."""
+    if path.startswith(REXGRADIENT_OLD_PREFIX):
+        return path.replace(REXGRADIENT_OLD_PREFIX, REXGRADIENT_NEW_PREFIX)
+    return path
+
 
 def extract_patient_id_from_path(path: str) -> str:
     """
@@ -153,7 +185,7 @@ def preprocess_chexpert_plus(
     # Process training set
     print("\nProcessing training set...")
     train_paths = df_train_clean['path_to_image'].apply(
-        lambda x: os.path.join(image_root, x)
+        lambda x: fix_chexpert_path(x, image_root)
     ).tolist()
 
     train_h5_path = os.path.join(output_dir, 'chexpert_plus_train.h5')
@@ -177,7 +209,7 @@ def preprocess_chexpert_plus(
     # Process validation set
     print("\nProcessing validation set...")
     valid_paths = df_valid['Path'].apply(
-        lambda x: os.path.join(image_root, x)
+        lambda x: fix_chexpert_path(x, image_root)
     ).tolist()
 
     valid_h5_path = os.path.join(output_dir, 'chexpert_plus_valid.h5')
@@ -197,7 +229,7 @@ def preprocess_chexpert_plus(
     # Process test set
     print("\nProcessing test set...")
     test_paths = df_test['Path'].apply(
-        lambda x: os.path.join(image_root, x)
+        lambda x: fix_chexpert_path(x, image_root)
     ).tolist()
 
     test_h5_path = os.path.join(output_dir, 'chexpert_plus_test.h5')
@@ -302,9 +334,8 @@ def preprocess_rexgradient(
         print(f"\nProcessing {split} set...")
         df_split = df[df['split'] == split].reset_index(drop=True)
 
-        image_paths = df_split['path_to_image'].apply(
-            lambda x: os.path.join(image_root, x) if image_root else x
-        ).tolist()
+        # Remap paths from HuggingFace cache to CBICA location
+        image_paths = df_split['path_to_image'].apply(fix_rexgradient_path).tolist()
         h5_path = os.path.join(output_dir, f'rexgradient_{split}.h5')
 
         img_to_hdf5_parallel(image_paths, h5_path, resolution=resolution, num_workers=num_workers)

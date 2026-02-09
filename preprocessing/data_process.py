@@ -15,8 +15,6 @@ import cv2
 from typing import *
 from pathlib import Path
 
-import torch
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 
 def load_data(filepath):
     dataframe = pd.read_csv(filepath)
