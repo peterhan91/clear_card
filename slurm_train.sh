@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
 #SBATCH --mem=128G
-#SBATCH --time=3-00:00:00
+#SBATCH --time=5-00:00:00
 #SBATCH --output=train_%j.out
 #SBATCH --error=train_%j.err
 #SBATCH --mail-type=END,FAIL
