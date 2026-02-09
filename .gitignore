@@ -42,6 +42,10 @@ env/
 *.hdf5
 data/h5/
 
+# Training checkpoints
+checkpoints/
+*.pt
+
 # Large CSV files tracked by Git LFS
 # data/chexpert_train.csv
 # data/chexpert_impressions.csv
