@@ -11,7 +11,7 @@
 #SBATCH --mail-user=tianyu.han@pennmedicine.upenn.edu
 
 source /cbica/projects/CXR/miniconda3/etc/profile.d/conda.sh
-conda activate axolotl
+conda activate ctproject
 
 REPO_PATH="/cbica/projects/CXR/codes/clear_card"
 cd "$REPO_PATH"
@@ -25,15 +25,13 @@ DATASET="${DATASET:-chexpert-plus}"
 # DATA_DIR: where CSV files are located
 DATA_DIR="${DATA_DIR:-data}"
 
-# OUTPUT_ROOT: root directory for preprocessed output (each dataset gets a subdirectory)
-OUTPUT_ROOT="${OUTPUT_ROOT:-/cbica/projects/CXR/data_p}"
-CHEXPERT_OUTPUT_DIR="${CHEXPERT_OUTPUT_DIR:-${OUTPUT_ROOT}/chexpert-plus}"
-REXGRADIENT_OUTPUT_DIR="${REXGRADIENT_OUTPUT_DIR:-${OUTPUT_ROOT}/rexgradient}"
+# OUTPUT_BASE: base directory for H5 output (subdirs created per dataset)
+OUTPUT_BASE="${OUTPUT_BASE:-/cbica/projects/CXR/data_p}"
 
 # IMAGE_ROOT: prepended to image paths in CSV
-# - CheXpert: set to parent of train/valid/test folders
-# - ReXGradient: set to "" if CSV has absolute paths
-CHEXPERT_IMAGE_ROOT="${CHEXPERT_IMAGE_ROOT:-/cbica/projects/CXR/chexpert}"
+# - CheXpert: set to parent of train/valid/test folders (PNG/PNG contains train/valid/test)
+# - ReXGradient: paths are remapped in code, so this is ignored
+CHEXPERT_IMAGE_ROOT="${CHEXPERT_IMAGE_ROOT:-/cbica/projects/CXR/data/CheXpert/chexpertplus/PNG/PNG}"
 REXGRADIENT_IMAGE_ROOT="${REXGRADIENT_IMAGE_ROOT:-}"
 
 # ============================================
@@ -48,9 +46,7 @@ echo "CXR Preprocessing Job"
 echo "========================================"
 echo "Dataset:              $DATASET"
 echo "Data dir (CSVs):      $DATA_DIR"
-echo "Output root:          $OUTPUT_ROOT"
-echo "CheXpert output:      $CHEXPERT_OUTPUT_DIR"
-echo "ReXGradient output:   $REXGRADIENT_OUTPUT_DIR"
+echo "Output base:          $OUTPUT_BASE"
 echo "CheXpert image root:  $CHEXPERT_IMAGE_ROOT"
 echo "ReXGradient img root: $REXGRADIENT_IMAGE_ROOT"
 echo "Resolution:           $RESOLUTION"
@@ -59,7 +55,10 @@ echo "Num workers:          $NUM_WORKERS"
 echo "========================================"
 
 # Create output directories
-mkdir -p "$CHEXPERT_OUTPUT_DIR" "$REXGRADIENT_OUTPUT_DIR"
+CHEXPERT_OUTPUT_DIR="${OUTPUT_BASE}/chexpert-plus"
+REXGRADIENT_OUTPUT_DIR="${OUTPUT_BASE}/rexgradient"
+mkdir -p "$CHEXPERT_OUTPUT_DIR"
+mkdir -p "$REXGRADIENT_OUTPUT_DIR"
 
 # ============================================
 # Preprocessing
@@ -67,6 +66,7 @@ mkdir -p "$CHEXPERT_OUTPUT_DIR" "$REXGRADIENT_OUTPUT_DIR"
 if [[ "$DATASET" == "chexpert-plus" || "$DATASET" == "both" ]]; then
     echo ""
     echo ">>> Processing CheXpert-Plus..."
+    echo ">>> Output: $CHEXPERT_OUTPUT_DIR"
     python preprocessing/preprocess_splits.py \
         --dataset chexpert-plus \
         --image_root "$CHEXPERT_IMAGE_ROOT" \
@@ -79,6 +79,7 @@ fi
 if [[ "$DATASET" == "rexgradient" || "$DATASET" == "both" ]]; then
     echo ""
     echo ">>> Processing ReXGradient..."
+    echo ">>> Output: $REXGRADIENT_OUTPUT_DIR"
     python preprocessing/preprocess_splits.py \
         --dataset rexgradient \
         --image_root "$REXGRADIENT_IMAGE_ROOT" \
@@ -92,41 +93,49 @@ fi
 # ============================================
 # Verification
 # ============================================
+echo ""
+echo "========================================"
+echo "Verifying patient splits..."
+echo "========================================"
 if [[ "$DATASET" == "chexpert-plus" || "$DATASET" == "both" ]]; then
-    echo ""
-    echo "========================================"
-    echo "Verifying CheXpert-Plus splits..."
-    echo "========================================"
     python preprocessing/preprocess_splits.py \
         --dataset chexpert-plus \
         --output_dir "$CHEXPERT_OUTPUT_DIR" \
         --verify_only
-    python preprocessing/preprocess_splits.py \
-        --dataset chexpert-plus \
-        --output_dir "$CHEXPERT_OUTPUT_DIR" \
-        --verify_pairing
-    echo "Output:"
-    ls -lh "$CHEXPERT_OUTPUT_DIR"
 fi
-
 if [[ "$DATASET" == "rexgradient" || "$DATASET" == "both" ]]; then
-    echo ""
-    echo "========================================"
-    echo "Verifying ReXGradient splits..."
-    echo "========================================"
     python preprocessing/preprocess_splits.py \
         --dataset rexgradient \
         --output_dir "$REXGRADIENT_OUTPUT_DIR" \
         --verify_only
-    python preprocessing/preprocess_splits.py \
-        --dataset rexgradient \
-        --output_dir "$REXGRADIENT_OUTPUT_DIR" \
-        --verify_pairing
-    echo "Output:"
-    ls -lh "$REXGRADIENT_OUTPUT_DIR"
 fi
 
 echo ""
 echo "========================================"
-echo "Done! Output saved to: $OUTPUT_ROOT"
+echo "Verifying H5-CSV pairing..."
 echo "========================================"
+if [[ "$DATASET" == "chexpert-plus" || "$DATASET" == "both" ]]; then
+    python preprocessing/preprocess_splits.py \
+        --dataset chexpert-plus \
+        --output_dir "$CHEXPERT_OUTPUT_DIR" \
+        --verify_pairing
+fi
+if [[ "$DATASET" == "rexgradient" || "$DATASET" == "both" ]]; then
+    python preprocessing/preprocess_splits.py \
+        --dataset rexgradient \
+        --output_dir "$REXGRADIENT_OUTPUT_DIR" \
+        --verify_pairing
+fi
+
+echo ""
+echo "========================================"
+echo "Done! Output saved to: $OUTPUT_BASE"
+echo "========================================"
+if [[ "$DATASET" == "chexpert-plus" || "$DATASET" == "both" ]]; then
+    echo "CheXpert-Plus:"
+    ls -lh "$CHEXPERT_OUTPUT_DIR"
+fi
+if [[ "$DATASET" == "rexgradient" || "$DATASET" == "both" ]]; then
+    echo "ReXGradient:"
+    ls -lh "$REXGRADIENT_OUTPUT_DIR"
+fi

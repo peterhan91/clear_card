@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:a100:2
 #SBATCH --mem=128G
 #SBATCH --time=5-00:00:00
 #SBATCH --output=train_%j.out
@@ -13,7 +13,7 @@
 #SBATCH --mail-user=tianyu.han@pennmedicine.upenn.edu
 
 source /cbica/projects/CXR/miniconda3/etc/profile.d/conda.sh
-conda activate chexzero
+conda activate ctproject
 
 REPO_PATH="/cbica/projects/CXR/codes/clear_card"
 cd "$REPO_PATH"
@@ -87,7 +87,7 @@ USE_MULTI="${USE_MULTI:-0}"
 DO_VALIDATE="${DO_VALIDATE:-1}"
 
 # Test after training (set TEST_AFTER=1 to enable)
-TEST_AFTER="${TEST_AFTER:-1}"
+TEST_AFTER="${TEST_AFTER:-0}"
 
 # Early stopping (set EARLY_STOPPING=1 to enable)
 EARLY_STOPPING="${EARLY_STOPPING:-1}"
