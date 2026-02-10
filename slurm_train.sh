@@ -55,7 +55,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 EPOCHS="${EPOCHS:-40}"
 LR="${LR:-1e-4}"
 SEED="${SEED:-1234}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
 
 # DDP options (set USE_DDP=1 to enable 2-GPU distributed training)
 USE_DDP="${USE_DDP:-1}"
