@@ -19,6 +19,29 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from eval import evaluate
 from train import load_data, load_clip, preprocess_text, setup_validation
 
+# Prompt templates for zero-shot evaluation
+# Designed to match common radiology report language. Templates must be
+# anatomically neutral (no "in the lungs") since CheXpert labels include
+# cardiac, pleural, osseous, and device findings.
+CXR_POS_TEMPLATES = [
+    "{}",
+    "findings consistent with {}",
+    "chest x-ray showing {}",
+    "evidence of {}",
+    "the chest radiograph demonstrates {}",
+    "{} is present",
+    "there is {}",
+]
+
+CXR_NEG_TEMPLATES = [
+    "no {}",
+    "no evidence of {}",
+    "chest x-ray with no {}",
+    "absence of {}",
+    "the chest radiograph is negative for {}",
+    "{} is absent",
+    "there is no {}",
+]
 
 
 class MultiCXRDataset(data.Dataset):
@@ -154,6 +177,8 @@ def parse_args():
                                 '/cbica/projects/CXR/data_p/rexgradient/rexgradient_train.h5,/cbica/projects/CXR/data_p/rexgradient/rexgradient_train_metadata.csv'],
                         help='List of dataset paths in format: img_path,txt_path')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--auto_batch_size', action='store_true',
+                        help='Automatically find the largest batch size that fits in ~90%% GPU RAM')
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.2)
@@ -196,15 +221,148 @@ def parse_args():
     parser.add_argument('--freeze_dinov3', action='store_true', help='Freeze DINOv3 backbone weights')
     # Early stopping arguments
     parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
-    parser.add_argument('--patience', type=int, default=5, help='Number of epochs to wait without improvement before stopping')
+    parser.add_argument('--patience', type=int, default=20, help='Number of epochs to wait without improvement before stopping')
     parser.add_argument('--min_delta', type=float, default=0.001, help='Minimum change to qualify as an improvement')
     parser.add_argument('--early_stopping_metric', type=str, default='mean_auc', 
                         choices=['mean_auc', 'loss'], help='Metric to use for early stopping')
     # DDP arguments
     parser.add_argument('--use_ddp', action='store_true', help='Use Distributed Data Parallel training')
     parser.add_argument('--backend', type=str, default='nccl', help='DDP backend')
+    parser.add_argument('--prompt_ensemble', type=str, default='off',
+                        choices=['off', 'on', 'both'],
+                        help='Prompt ensembling mode: off=single template, on=ensemble, both=compare')
     args = parser.parse_args()
     return args
+
+def _try_batch_size(model, device, batch_size, img_resolution, context_length):
+    """Run one forward+backward pass with dummy data to test if batch_size fits in GPU memory.
+
+    Returns:
+        (success, peak_memory_bytes): Whether the batch fit, and peak GPU memory used.
+    """
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.empty_cache()
+    try:
+        dummy_imgs = torch.randn(batch_size, 3, img_resolution, img_resolution, device=device)
+        dummy_texts = torch.randint(0, 49408, (batch_size, context_length), device=device)
+        with torch.amp.autocast('cuda'):
+            logits_per_image, logits_per_text = model(dummy_imgs, dummy_texts)
+            labels = torch.arange(batch_size, device=device)
+            loss = (nn.functional.cross_entropy(logits_per_image, labels) +
+                    nn.functional.cross_entropy(logits_per_text, labels)) / 2
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+        peak_mem = torch.cuda.max_memory_allocated(device)
+        del dummy_imgs, dummy_texts, logits_per_image, logits_per_text, labels, loss
+        torch.cuda.empty_cache()
+        return True, peak_mem
+    except torch.cuda.OutOfMemoryError:
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        return False, 0
+
+
+def _binary_search_batch_size(model, device, img_resolution, context_length,
+                               target_fraction=0.90, initial_bs=8):
+    """Find the largest batch size fitting within target_fraction of GPU memory.
+
+    Phase 1: Double from initial_bs until OOM to find upper bound.
+    Phase 2: Binary search between lo and hi until hi - lo <= 4.
+    Final result is rounded down to a multiple of 8 for tensor core efficiency.
+    """
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    target_mem = total_mem * target_fraction
+    print(f"[AutoBS] GPU total memory: {total_mem / 1e9:.1f} GB, target ({target_fraction*100:.0f}%): {target_mem / 1e9:.1f} GB")
+
+    # Phase 1: exponential growth to find upper bound
+    lo = initial_bs
+    hi = initial_bs
+    success, peak = _try_batch_size(model, device, lo, img_resolution, context_length)
+    if not success:
+        print(f"[AutoBS] Even batch_size={lo} causes OOM. Using minimum batch_size=8.")
+        return 8
+    print(f"[AutoBS] bs={lo}: OK (peak {peak / 1e9:.2f} GB)")
+
+    while True:
+        candidate = hi * 2
+        success, peak = _try_batch_size(model, device, candidate, img_resolution, context_length)
+        if success and peak <= target_mem:
+            print(f"[AutoBS] bs={candidate}: OK (peak {peak / 1e9:.2f} GB)")
+            lo = candidate
+            hi = candidate
+        else:
+            if success:
+                print(f"[AutoBS] bs={candidate}: fits but exceeds target (peak {peak / 1e9:.2f} GB)")
+            else:
+                print(f"[AutoBS] bs={candidate}: OOM")
+            hi = candidate
+            break
+
+    # Phase 2: binary search
+    while hi - lo > 4:
+        mid = (lo + hi) // 2
+        # Round mid to multiple of 8
+        mid = max(lo, (mid // 8) * 8)
+        if mid == lo:
+            mid = lo + 8
+        if mid >= hi:
+            break
+        success, peak = _try_batch_size(model, device, mid, img_resolution, context_length)
+        if success and peak <= target_mem:
+            print(f"[AutoBS] bs={mid}: OK (peak {peak / 1e9:.2f} GB)")
+            lo = mid
+        else:
+            if success:
+                print(f"[AutoBS] bs={mid}: exceeds target (peak {peak / 1e9:.2f} GB)")
+            else:
+                print(f"[AutoBS] bs={mid}: OOM")
+            hi = mid
+
+    # Round down to multiple of 8, minimum 8
+    result = max(8, (lo // 8) * 8)
+    print(f"[AutoBS] Selected batch_size={result}")
+    return result
+
+
+def find_optimal_batch_size(config, rank=0):
+    """Load a temporary model, run binary search for max batch size, clean up.
+
+    Uses 85% target for DDP (headroom for communication buffers), 90% for single GPU.
+    """
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
+
+    print(f"[AutoBS] Loading temporary model for batch size search on rank {rank}...")
+    model = load_clip(
+        model_path=None,
+        pretrained=not config.random_init,
+        context_length=config.context_length,
+        use_dinov3=config.use_dinov3,
+        dinov3_model_name=config.dinov3_model_name,
+        dinov3_repo_dir=config.dinov3_repo_dir,
+        dinov3_weights=config.dinov3_weights,
+        freeze_dinov3=config.freeze_dinov3,
+    )
+    model.to(device)
+    model.train()
+
+    # Determine image resolution (must match what load_data / load_multi_data uses)
+    pretrained = not config.random_init
+    img_resolution = 448 if (pretrained or config.use_dinov3) else 320
+
+    target = 0.85 if config.use_ddp else 0.90
+    optimal_bs = _binary_search_batch_size(
+        model, device, img_resolution, config.context_length,
+        target_fraction=target, initial_bs=8,
+    )
+
+    # Cleanup temporary model
+    del model
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    print(f"[AutoBS] Temporary model cleaned up. Will use batch_size={optimal_bs}")
+    return optimal_bs
+
 
 def setup_ddp(backend='nccl'):
     """Initialize the distributed environment using torchrun."""
@@ -269,6 +427,18 @@ def ddp_main(config, verbose=0):
         if rank == 0:
             print(f"Using checkpoint folder: {config.model_name}")
 
+    # Auto batch size: rank 0 searches, then broadcasts to all ranks
+    if config.auto_batch_size:
+        if rank == 0:
+            found_bs = find_optimal_batch_size(config, rank=0)
+        else:
+            found_bs = 0
+        bs_tensor = torch.tensor(found_bs, dtype=torch.int64, device=f'cuda:{rank}')
+        dist.broadcast(bs_tensor, src=0)
+        config.batch_size = int(bs_tensor.item())
+        if rank == 0:
+            print(f"[AutoBS] All ranks using batch_size={config.batch_size}")
+
     try:
         model, data_loader, device, criterion, optimizer, scheduler, scaler = make(config, rank)
         train(model, data_loader, device, criterion, optimizer, scheduler, scaler, config, rank)
@@ -304,6 +474,11 @@ def single_gpu_pipeline(config, verbose=0):
         print(f"Using checkpoint folder: {config.model_name} (ViT variant: {vit_variant})")
     else:
         print(f"Using checkpoint folder: {config.model_name}")
+
+    # Auto batch size: find optimal before loading data
+    if config.auto_batch_size:
+        config.batch_size = find_optimal_batch_size(config)
+        print(f"[AutoBS] Using batch_size={config.batch_size}")
 
     model, data_loader, device, criterion, optimizer, scheduler, scaler = make(config)
     train(model, data_loader, device, criterion, optimizer, scheduler, scaler, config)
@@ -402,10 +577,16 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
         model_save_dir = os.path.join(config.save_dir, config.model_name)
         os.makedirs(model_save_dir, exist_ok=True)
 
-        # Initialize validation log file
+        # Initialize validation log file with all 14 CheXpert classes
         val_log_path = os.path.join(model_save_dir, "validation_log.txt")
+        all_val_label_cols = [l.replace(' ', '_') + '_AUC' for l in val_labels]
+        ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
+        header_cols = "Step,Epoch,Mean_AUC," + ",".join(all_val_label_cols)
+        if ensemble_mode == 'both':
+            ens_label_cols = ['Ens_' + l.replace(' ', '_') + '_AUC' for l in val_labels]
+            header_cols += ",Ensemble_Mean_AUC," + ",".join(ens_label_cols)
         with open(val_log_path, 'w') as f:
-            f.write("Step,Epoch,Mean_AUC,Atelectasis_AUC,Cardiomegaly_AUC,Consolidation_AUC,Edema_AUC,Pleural_Effusion_AUC\n")
+            f.write(header_cols + "\n")
 
         # Best model tracking variables 
         best_metric = float('-inf') if config.early_stopping_metric == 'mean_auc' else float('inf')
@@ -460,27 +641,47 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
                 if config.do_validate and validation_enabled and (batch_ct % config.valid_interval) == 0:
                     # Get the actual model for validation (unwrap DDP if needed)
                     model_for_validation = model.module if hasattr(model, 'module') else model
-                    val_results_df = run_validation_step(model_for_validation, val_loader, y_true_val, val_labels, val_templates, device, config)
-                    
-                    # Calculate mean AUC for key pathologies
-                    key_pathologies = ['Atelectasis_auc', 'Cardiomegaly_auc', 'Consolidation_auc', 'Edema_auc', 'Pleural Effusion_auc']
-                    available_cols = [col for col in key_pathologies if col in val_results_df.columns]
-                    if available_cols:
-                        current_auc = val_results_df[available_cols].mean().mean()
+                    val_result = run_validation_step(model_for_validation, val_loader, y_true_val, val_labels, val_templates, device, config)
+
+                    # Extract results depending on ensemble mode
+                    if ensemble_mode == 'both':
+                        val_results_df = val_result["single"]
+                        ens_results_df = val_result["ensemble"]
                     else:
-                        auc_cols = [col for col in val_results_df.columns if col.endswith('_auc')]
-                        current_auc = val_results_df[auc_cols].mean().mean() if auc_cols else 0
-                    
-                    # Log validation results
+                        val_results_df = val_result
+
+                    # Calculate mean AUC over all 14 classes
+                    auc_cols = [col for col in val_results_df.columns if col.endswith('_auc')]
+                    current_auc = val_results_df[auc_cols].mean().mean() if auc_cols else 0
+
+                    # Log validation results for all classes
+                    all_auc_cols = [l + '_auc' for l in val_labels]
+                    auc_values = [val_results_df[col].iloc[0] if col in val_results_df.columns else 0 for col in all_auc_cols]
+                    log_line = f"{batch_ct},{epoch},{current_auc:.4f},{','.join(f'{v:.4f}' for v in auc_values)}"
+
+                    if ensemble_mode == 'both':
+                        ens_auc_cols = [col for col in ens_results_df.columns if col.endswith('_auc')]
+                        ens_auc = ens_results_df[ens_auc_cols].mean().mean() if ens_auc_cols else 0
+                        ens_values = [ens_results_df[col].iloc[0] if col in ens_results_df.columns else 0 for col in all_auc_cols]
+                        log_line += f",{ens_auc:.4f},{','.join(f'{v:.4f}' for v in ens_values)}"
+
                     with open(val_log_path, 'a') as f:
-                        auc_values = [val_results_df[col].iloc[0] if col in val_results_df.columns else 0 for col in key_pathologies]
-                        f.write(f"{batch_ct},{epoch},{current_auc:.4f},{','.join(f'{v:.4f}' for v in auc_values)}\n")
-                    
-                    print(f"Validation at step {batch_ct}: Mean AUC = {current_auc:.4f}")
-                    
+                        f.write(log_line + "\n")
+
+                    if ensemble_mode == 'both':
+                        print(f"Validation at step {batch_ct}: Single Mean AUC = {current_auc:.4f} | Ensemble Mean AUC = {ens_auc:.4f}")
+                        # Use ensemble AUC for best-model tracking
+                        tracking_auc = ens_auc
+                    elif ensemble_mode == 'on':
+                        print(f"Validation at step {batch_ct}: [Ensemble] Mean AUC = {current_auc:.4f}")
+                        tracking_auc = current_auc
+                    else:
+                        print(f"Validation at step {batch_ct}: Mean AUC = {current_auc:.4f}")
+                        tracking_auc = current_auc
+
                     # Check if this is the best model so far
-                    if current_auc > best_metric + config.min_delta:
-                        best_metric = current_auc
+                    if tracking_auc > best_metric + config.min_delta:
+                        best_metric = tracking_auc
                         best_step = batch_ct
                         best_epoch = epoch
                         epochs_without_improvement = 0
@@ -488,7 +689,7 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
                         best_model_path = os.path.join(model_save_dir, "best_model.pt")
                         model_to_save = model.module if hasattr(model, 'module') else model
                         save(model_to_save, best_model_path)
-                        print(f"New best model saved! AUC: {current_auc:.4f} at step {batch_ct}")
+                        print(f"New best model saved! AUC: {tracking_auc:.4f} at step {batch_ct}")
                     else:
                         epochs_without_improvement += 1
         
@@ -517,37 +718,88 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
 def train_log(loss, example_ct, epoch):
     print(f"Loss after {str(example_ct).zfill(5)} examples (Epoch {epoch}): {loss:.3f}")
 
+def compute_text_features(model, labels, pos_templates, neg_templates, context_length, device):
+    """Compute L2-normalized text features, optionally averaging across multiple templates.
+
+    For each label, every template is tokenized, encoded, and L2-normalized individually.
+    The per-template embeddings are then averaged and re-normalized to produce one vector
+    per label.
+
+    Returns:
+        (pos_features, neg_features) each of shape (num_labels, embedding_dim)
+    """
+    all_pos, all_neg = [], []
+    with torch.no_grad():
+        for tmpl in pos_templates:
+            texts = [tmpl.format(c) for c in labels]
+            tokens = clip.tokenize(texts, context_length).to(device)
+            feats = model.encode_text(tokens)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            all_pos.append(feats)
+        for tmpl in neg_templates:
+            texts = [tmpl.format(c) for c in labels]
+            tokens = clip.tokenize(texts, context_length).to(device)
+            feats = model.encode_text(tokens)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            all_neg.append(feats)
+
+    # Average across templates and re-normalize
+    pos_features = torch.stack(all_pos).mean(dim=0)
+    pos_features = pos_features / pos_features.norm(dim=-1, keepdim=True)
+    neg_features = torch.stack(all_neg).mean(dim=0)
+    neg_features = neg_features / neg_features.norm(dim=-1, keepdim=True)
+    return pos_features, neg_features
+
+
+def _compute_predictions(img_feats, pos_features, neg_features):
+    """Compute softmax probabilities from image and text features."""
+    logits_pos = img_feats @ pos_features.T
+    logits_neg = img_feats @ neg_features.T
+    probs = torch.exp(logits_pos) / (torch.exp(logits_pos) + torch.exp(logits_neg))
+    return probs.cpu().numpy()
+
+
 def run_validation_step(model, val_loader, y_true_val, val_labels, val_templates, device, config):
+    """Run validation with single, ensemble, or both prompt modes.
+
+    Returns:
+        When prompt_ensemble is 'off' or 'on': a single DataFrame of AUC results.
+        When prompt_ensemble is 'both': dict {"single": df, "ensemble": df}.
+    """
     model.eval()
     context_length = getattr(model, 'context_length', config.context_length)
-    pos_template, neg_template = val_templates[0]
+    ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
 
-    with torch.no_grad():
-        pos_texts = [pos_template.format(c) for c in val_labels]
-        neg_texts = [neg_template.format(c) for c in val_labels]
-        pos_tokens = clip.tokenize(pos_texts, context_length).to(device)
-        neg_tokens = clip.tokenize(neg_texts, context_length).to(device)
-        pos_features = model.encode_text(pos_tokens)
-        neg_features = model.encode_text(neg_tokens)
-        pos_features /= pos_features.norm(dim=-1, keepdim=True)
-        neg_features /= neg_features.norm(dim=-1, keepdim=True)
-
+    # Encode images once (shared across modes)
     all_img_feats = []
     with torch.no_grad():
-        for data in tqdm(val_loader, desc="Validation Inference"):
-            imgs = data['img'].to(device)
+        for batch in tqdm(val_loader, desc="Validation Inference"):
+            imgs = batch['img'].to(device)
             feats = model.encode_image(imgs)
-            feats /= feats.norm(dim=-1, keepdim=True)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
             all_img_feats.append(feats.cpu())
-
     img_feats_cat = torch.cat(all_img_feats).to(device)
-    logits_pos = img_feats_cat @ pos_features.T
-    logits_neg = img_feats_cat @ neg_features.T
-    probs = torch.exp(logits_pos) / (torch.exp(logits_pos) + torch.exp(logits_neg))
-    y_pred_val = probs.cpu().numpy()
-    val_results_df = evaluate(y_pred_val, y_true_val, val_labels)
+
+    if ensemble_mode == 'off':
+        pos_f, neg_f = compute_text_features(model, val_labels, ["{}"], ["no {}"], context_length, device)
+        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
+        result = evaluate(y_pred, y_true_val, val_labels)
+    elif ensemble_mode == 'on':
+        pos_f, neg_f = compute_text_features(model, val_labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
+        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
+        result = evaluate(y_pred, y_true_val, val_labels)
+    else:  # 'both'
+        pos_s, neg_s = compute_text_features(model, val_labels, ["{}"], ["no {}"], context_length, device)
+        pos_e, neg_e = compute_text_features(model, val_labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
+        y_pred_s = _compute_predictions(img_feats_cat, pos_s, neg_s)
+        y_pred_e = _compute_predictions(img_feats_cat, pos_e, neg_e)
+        result = {
+            "single": evaluate(y_pred_s, y_true_val, val_labels),
+            "ensemble": evaluate(y_pred_e, y_true_val, val_labels),
+        }
+
     model.train()
-    return val_results_df
+    return result
 
 def save(model, path):
     torch.save(model.state_dict(), path)
@@ -621,42 +873,72 @@ def setup_test_dataset(test_cxr_filepath, test_label_path, labels, config):
     return test_loader, y_true_test
 
 def test_model_on_dataset(model, test_loader, y_true_test, labels, templates, device, config, dataset_name):
-    """Test model on a specific dataset and return results."""
+    """Test model on a specific dataset and return results.
+
+    Returns:
+        When prompt_ensemble is 'off' or 'on': a single DataFrame.
+        When prompt_ensemble is 'both': dict {"single": df, "ensemble": df}.
+    """
     model.eval()
     context_length = getattr(model, 'context_length', config.context_length)
-    pos_template, neg_template = templates[0]
-    
+    ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
+
     print(f"\n=== Testing on {dataset_name} ===")
-    
-    # Encode text templates
-    with torch.no_grad():
-        pos_texts = [pos_template.format(c) for c in labels]
-        neg_texts = [neg_template.format(c) for c in labels]
-        pos_tokens = clip.tokenize(pos_texts, context_length).to(device)
-        neg_tokens = clip.tokenize(neg_texts, context_length).to(device)
-        pos_features = model.encode_text(pos_tokens)
-        neg_features = model.encode_text(neg_tokens)
-        pos_features /= pos_features.norm(dim=-1, keepdim=True)
-        neg_features /= neg_features.norm(dim=-1, keepdim=True)
-    
-    # Extract image features
+
+    # Extract image features once
     all_img_feats = []
     with torch.no_grad():
-        for data in tqdm(test_loader, desc=f"Testing on {dataset_name}"):
-            imgs = data['img'].to(device)
+        for batch in tqdm(test_loader, desc=f"Testing on {dataset_name}"):
+            imgs = batch['img'].to(device)
             feats = model.encode_image(imgs)
-            feats /= feats.norm(dim=-1, keepdim=True)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
             all_img_feats.append(feats.cpu())
-    
-    # Compute predictions and evaluate
     img_feats_cat = torch.cat(all_img_feats).to(device)
-    logits_pos = img_feats_cat @ pos_features.T
-    logits_neg = img_feats_cat @ neg_features.T
-    probs = torch.exp(logits_pos) / (torch.exp(logits_pos) + torch.exp(logits_neg))
-    y_pred_test = probs.cpu().numpy()
-    
-    test_results_df = evaluate(y_pred_test, y_true_test, labels)
-    return test_results_df
+
+    if ensemble_mode == 'off':
+        pos_f, neg_f = compute_text_features(model, labels, ["{}"], ["no {}"], context_length, device)
+        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
+        return evaluate(y_pred, y_true_test, labels)
+    elif ensemble_mode == 'on':
+        pos_f, neg_f = compute_text_features(model, labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
+        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
+        return evaluate(y_pred, y_true_test, labels)
+    else:  # 'both'
+        pos_s, neg_s = compute_text_features(model, labels, ["{}"], ["no {}"], context_length, device)
+        pos_e, neg_e = compute_text_features(model, labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
+        y_pred_s = _compute_predictions(img_feats_cat, pos_s, neg_s)
+        y_pred_e = _compute_predictions(img_feats_cat, pos_e, neg_e)
+        return {
+            "single": evaluate(y_pred_s, y_true_test, labels),
+            "ensemble": evaluate(y_pred_e, y_true_test, labels),
+        }
+
+def _print_test_df(results_df, dataset_name, tag=""):
+    """Print AUC summary for a test results DataFrame."""
+    prefix = f"[{tag}] " if tag else ""
+    auc_cols = [col for col in results_df.columns if col.endswith('_auc')]
+    if auc_cols:
+        mean_auc = results_df[auc_cols].mean().mean()
+        print(f"{prefix}{dataset_name} Mean AUC (all {len(auc_cols)} classes): {mean_auc:.4f}")
+        for col in auc_cols:
+            print(f"  {col}: {results_df[col].iloc[0]:.4f}")
+
+
+def _save_and_print_test_results(results, results_dir, dataset_prefix, ensemble_mode):
+    """Save and print test results, handling both single and dict (both) formats."""
+    if ensemble_mode == 'both':
+        for mode_name, df in results.items():
+            path = os.path.join(results_dir, f"{dataset_prefix}_test_results_{mode_name}.csv")
+            df.to_csv(path, index=False)
+            print(f"{dataset_prefix.title()} {mode_name} results saved to: {path}")
+            _print_test_df(df, f"{dataset_prefix.title()} Test", tag=mode_name.title())
+    else:
+        tag = "Ensemble" if ensemble_mode == 'on' else ""
+        path = os.path.join(results_dir, f"{dataset_prefix}_test_results.csv")
+        results.to_csv(path, index=False)
+        print(f"{dataset_prefix.title()} test results saved to: {path}")
+        _print_test_df(results, f"{dataset_prefix.title()} Test", tag=tag)
+
 
 def run_final_testing(config):
     """Run testing on both CheXpert and PadChest test datasets using the best model."""
@@ -684,6 +966,8 @@ def run_final_testing(config):
     results_dir = os.path.join(config.save_dir, config.model_name, "test_results")
     os.makedirs(results_dir, exist_ok=True)
     
+    ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
+
     # Test on CheXpert
     if os.path.exists(config.chexpert_test_cxr) and os.path.exists(config.chexpert_test_labels):
         chexpert_labels = ['Atelectasis','Cardiomegaly', 'Consolidation', 'Edema',
@@ -691,49 +975,36 @@ def run_final_testing(config):
                           'Lung Opacity', 'No Finding','Pleural Effusion',
                           'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices']
         chexpert_templates = [("{}", "no {}")]
-        
+
         chexpert_loader, y_true_chexpert = setup_test_dataset(
             config.chexpert_test_cxr, config.chexpert_test_labels, chexpert_labels, config)
-        
+
         chexpert_results = test_model_on_dataset(
-            model, chexpert_loader, y_true_chexpert, chexpert_labels, 
+            model, chexpert_loader, y_true_chexpert, chexpert_labels,
             chexpert_templates, device, config, "CheXpert Test")
-        
-        chexpert_results.to_csv(os.path.join(results_dir, "chexpert_test_results.csv"), index=False)
-        print(f"CheXpert test results saved to: {results_dir}/chexpert_test_results.csv")
-        
-        # Print key results
-        key_cols = ['Atelectasis_auc', 'Cardiomegaly_auc', 'Consolidation_auc', 'Edema_auc', 'Pleural Effusion_auc']
-        available_cols = [col for col in key_cols if col in chexpert_results.columns]
-        if available_cols:
-            mean_auc = chexpert_results[available_cols].mean().mean()
-            print(f"CheXpert Mean AUC (key pathologies): {mean_auc:.4f}")
-    
-    # Test on PadChest  
+
+        _save_and_print_test_results(chexpert_results, results_dir, "chexpert", ensemble_mode)
+
+    # Test on PadChest
     if os.path.exists(config.padchest_test_cxr) and os.path.exists(config.padchest_test_labels):
         # Read PadChest labels from CSV
         df_padchest = pd.read_csv(config.padchest_test_labels)
         if 'is_test' in df_padchest.columns:
             df_padchest = df_padchest[df_padchest['is_test'] == True]
-        
+
         # Get disease labels (excluding ImageID, name, Path, is_test columns)
         exclude_cols = ['ImageID', 'name', 'Path', 'is_test']
         padchest_labels = [col.lower() for col in df_padchest.columns if col not in exclude_cols]
         padchest_templates = [("{}", "no {}")]
-        
+
         padchest_loader, y_true_padchest = setup_test_dataset(
             config.padchest_test_cxr, config.padchest_test_labels, padchest_labels, config)
-        
+
         padchest_results = test_model_on_dataset(
             model, padchest_loader, y_true_padchest, padchest_labels,
             padchest_templates, device, config, "PadChest Test")
-        
-        padchest_results.to_csv(os.path.join(results_dir, "padchest_test_results.csv"), index=False)
-        print(f"PadChest test results saved to: {results_dir}/padchest_test_results.csv")
-        
-        # Print summary
-        mean_auc = padchest_results.mean(axis=1).iloc[0] if len(padchest_results) > 0 else 0
-        print(f"PadChest Mean AUC (all pathologies): {mean_auc:.4f}")
+
+        _save_and_print_test_results(padchest_results, results_dir, "padchest", ensemble_mode)
     
     print("\n" + "="*60)
     print("FINAL TESTING COMPLETED")
