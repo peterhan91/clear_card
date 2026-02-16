@@ -95,9 +95,6 @@ EARLY_STOPPING="${EARLY_STOPPING:-1}"
 # Auto batch size (set AUTO_BS=1 to enable automatic batch size discovery)
 AUTO_BS="${AUTO_BS:-0}"
 
-# Prompt ensemble mode: off (single template), on (ensemble), both (compare)
-PROMPT_ENSEMBLE="${PROMPT_ENSEMBLE:-off}"
-
 echo "========================================"
 echo "CXR CLIP Training Job"
 echo "========================================"
@@ -110,7 +107,6 @@ echo "Multi-dataset:   $USE_MULTI"
 echo "Validation:      $DO_VALIDATE"
 echo "DINOv3:          $USE_DINOV3 ($DINOV3_MODEL)"
 echo "Auto batch size: $AUTO_BS"
-echo "Prompt ensemble: $PROMPT_ENSEMBLE"
 echo "Batch size:      $BATCH_SIZE per GPU"
 echo "Grad accum:      $GRAD_ACCUM"
 echo "Effective batch: $((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM))"
@@ -135,8 +131,7 @@ if [ "$TRAIN_SCRIPT" == "run_train_improved" ]; then
         --val_cxr_filepath $VAL_CXR \
         --val_label_path $VAL_LABELS \
         --chexpert_test_cxr $TEST_CXR \
-        --chexpert_test_labels $TEST_LABELS \
-        --prompt_ensemble $PROMPT_ENSEMBLE"
+        --chexpert_test_labels $TEST_LABELS"
 
     if [ "$USE_DDP" == "1" ]; then
         ARGS="$ARGS --use_ddp"

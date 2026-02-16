@@ -19,30 +19,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from eval import evaluate
 from train import load_data, load_clip, preprocess_text, setup_validation
 
-# Prompt templates for zero-shot evaluation
-# Designed to match common radiology report language. Templates must be
-# anatomically neutral (no "in the lungs") since CheXpert labels include
-# cardiac, pleural, osseous, and device findings.
-CXR_POS_TEMPLATES = [
-    "{}",
-    "findings consistent with {}",
-    "chest x-ray showing {}",
-    "evidence of {}",
-    "the chest radiograph demonstrates {}",
-    "{} is present",
-    "there is {}",
-]
-
-CXR_NEG_TEMPLATES = [
-    "no {}",
-    "no evidence of {}",
-    "chest x-ray with no {}",
-    "absence of {}",
-    "the chest radiograph is negative for {}",
-    "{} is absent",
-    "there is no {}",
-]
-
 
 class MultiCXRDataset(data.Dataset):
     def __init__(self, dataset_paths, column='impression', transform=None):
@@ -228,9 +204,6 @@ def parse_args():
     # DDP arguments
     parser.add_argument('--use_ddp', action='store_true', help='Use Distributed Data Parallel training')
     parser.add_argument('--backend', type=str, default='nccl', help='DDP backend')
-    parser.add_argument('--prompt_ensemble', type=str, default='off',
-                        choices=['off', 'on', 'both'],
-                        help='Prompt ensembling mode: off=single template, on=ensemble, both=compare')
     args = parser.parse_args()
     return args
 
@@ -580,11 +553,7 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
         # Initialize validation log file with all 14 CheXpert classes
         val_log_path = os.path.join(model_save_dir, "validation_log.txt")
         all_val_label_cols = [l.replace(' ', '_') + '_AUC' for l in val_labels]
-        ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
         header_cols = "Step,Epoch,Mean_AUC," + ",".join(all_val_label_cols)
-        if ensemble_mode == 'both':
-            ens_label_cols = ['Ens_' + l.replace(' ', '_') + '_AUC' for l in val_labels]
-            header_cols += ",Ensemble_Mean_AUC," + ",".join(ens_label_cols)
         with open(val_log_path, 'w') as f:
             f.write(header_cols + "\n")
 
@@ -641,14 +610,7 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
                 if config.do_validate and validation_enabled and (batch_ct % config.valid_interval) == 0:
                     # Get the actual model for validation (unwrap DDP if needed)
                     model_for_validation = model.module if hasattr(model, 'module') else model
-                    val_result = run_validation_step(model_for_validation, val_loader, y_true_val, val_labels, val_templates, device, config)
-
-                    # Extract results depending on ensemble mode
-                    if ensemble_mode == 'both':
-                        val_results_df = val_result["single"]
-                        ens_results_df = val_result["ensemble"]
-                    else:
-                        val_results_df = val_result
+                    val_results_df = run_validation_step(model_for_validation, val_loader, y_true_val, val_labels, val_templates, device, config)
 
                     # Calculate mean AUC over all 14 classes
                     auc_cols = [col for col in val_results_df.columns if col.endswith('_auc')]
@@ -659,25 +621,11 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
                     auc_values = [val_results_df[col].iloc[0] if col in val_results_df.columns else 0 for col in all_auc_cols]
                     log_line = f"{batch_ct},{epoch},{current_auc:.4f},{','.join(f'{v:.4f}' for v in auc_values)}"
 
-                    if ensemble_mode == 'both':
-                        ens_auc_cols = [col for col in ens_results_df.columns if col.endswith('_auc')]
-                        ens_auc = ens_results_df[ens_auc_cols].mean().mean() if ens_auc_cols else 0
-                        ens_values = [ens_results_df[col].iloc[0] if col in ens_results_df.columns else 0 for col in all_auc_cols]
-                        log_line += f",{ens_auc:.4f},{','.join(f'{v:.4f}' for v in ens_values)}"
-
                     with open(val_log_path, 'a') as f:
                         f.write(log_line + "\n")
 
-                    if ensemble_mode == 'both':
-                        print(f"Validation at step {batch_ct}: Single Mean AUC = {current_auc:.4f} | Ensemble Mean AUC = {ens_auc:.4f}")
-                        # Use ensemble AUC for best-model tracking
-                        tracking_auc = ens_auc
-                    elif ensemble_mode == 'on':
-                        print(f"Validation at step {batch_ct}: [Ensemble] Mean AUC = {current_auc:.4f}")
-                        tracking_auc = current_auc
-                    else:
-                        print(f"Validation at step {batch_ct}: Mean AUC = {current_auc:.4f}")
-                        tracking_auc = current_auc
+                    print(f"Validation at step {batch_ct}: Mean AUC = {current_auc:.4f}")
+                    tracking_auc = current_auc
 
                     # Check if this is the best model so far
                     if tracking_auc > best_metric + config.min_delta:
@@ -718,59 +666,26 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
 def train_log(loss, example_ct, epoch):
     print(f"Loss after {str(example_ct).zfill(5)} examples (Epoch {epoch}): {loss:.3f}")
 
-def compute_text_features(model, labels, pos_templates, neg_templates, context_length, device):
-    """Compute L2-normalized text features, optionally averaging across multiple templates.
-
-    For each label, every template is tokenized, encoded, and L2-normalized individually.
-    The per-template embeddings are then averaged and re-normalized to produce one vector
-    per label.
-
-    Returns:
-        (pos_features, neg_features) each of shape (num_labels, embedding_dim)
-    """
-    all_pos, all_neg = [], []
-    with torch.no_grad():
-        for tmpl in pos_templates:
-            texts = [tmpl.format(c) for c in labels]
-            tokens = clip.tokenize(texts, context_length).to(device)
-            feats = model.encode_text(tokens)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-            all_pos.append(feats)
-        for tmpl in neg_templates:
-            texts = [tmpl.format(c) for c in labels]
-            tokens = clip.tokenize(texts, context_length).to(device)
-            feats = model.encode_text(tokens)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-            all_neg.append(feats)
-
-    # Average across templates and re-normalize
-    pos_features = torch.stack(all_pos).mean(dim=0)
-    pos_features = pos_features / pos_features.norm(dim=-1, keepdim=True)
-    neg_features = torch.stack(all_neg).mean(dim=0)
-    neg_features = neg_features / neg_features.norm(dim=-1, keepdim=True)
-    return pos_features, neg_features
-
-
-def _compute_predictions(img_feats, pos_features, neg_features):
-    """Compute softmax probabilities from image and text features."""
-    logits_pos = img_feats @ pos_features.T
-    logits_neg = img_feats @ neg_features.T
-    probs = torch.exp(logits_pos) / (torch.exp(logits_pos) + torch.exp(logits_neg))
-    return probs.cpu().numpy()
-
-
 def run_validation_step(model, val_loader, y_true_val, val_labels, val_templates, device, config):
-    """Run validation with single, ensemble, or both prompt modes.
+    """Run zero-shot validation using the original ("{}", "no {}") template pair.
 
-    Returns:
-        When prompt_ensemble is 'off' or 'on': a single DataFrame of AUC results.
-        When prompt_ensemble is 'both': dict {"single": df, "ensemble": df}.
+    Returns a DataFrame of AUC results.
     """
     model.eval()
     context_length = getattr(model, 'context_length', config.context_length)
-    ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
 
-    # Encode images once (shared across modes)
+    # Compute text features for positive and negative prompts
+    with torch.no_grad():
+        pos_texts = ["{}" .format(c) for c in val_labels]
+        neg_texts = ["no {}".format(c) for c in val_labels]
+        pos_tokens = clip.tokenize(pos_texts, context_length).to(device)
+        neg_tokens = clip.tokenize(neg_texts, context_length).to(device)
+        pos_features = model.encode_text(pos_tokens)
+        neg_features = model.encode_text(neg_tokens)
+        pos_features = pos_features / pos_features.norm(dim=-1, keepdim=True)
+        neg_features = neg_features / neg_features.norm(dim=-1, keepdim=True)
+
+    # Encode images and compute predictions
     all_img_feats = []
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validation Inference"):
@@ -780,24 +695,12 @@ def run_validation_step(model, val_loader, y_true_val, val_labels, val_templates
             all_img_feats.append(feats.cpu())
     img_feats_cat = torch.cat(all_img_feats).to(device)
 
-    if ensemble_mode == 'off':
-        pos_f, neg_f = compute_text_features(model, val_labels, ["{}"], ["no {}"], context_length, device)
-        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
-        result = evaluate(y_pred, y_true_val, val_labels)
-    elif ensemble_mode == 'on':
-        pos_f, neg_f = compute_text_features(model, val_labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
-        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
-        result = evaluate(y_pred, y_true_val, val_labels)
-    else:  # 'both'
-        pos_s, neg_s = compute_text_features(model, val_labels, ["{}"], ["no {}"], context_length, device)
-        pos_e, neg_e = compute_text_features(model, val_labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
-        y_pred_s = _compute_predictions(img_feats_cat, pos_s, neg_s)
-        y_pred_e = _compute_predictions(img_feats_cat, pos_e, neg_e)
-        result = {
-            "single": evaluate(y_pred_s, y_true_val, val_labels),
-            "ensemble": evaluate(y_pred_e, y_true_val, val_labels),
-        }
+    # Softmax evaluation
+    logits_pos = img_feats_cat @ pos_features.T
+    logits_neg = img_feats_cat @ neg_features.T
+    y_pred = (torch.exp(logits_pos) / (torch.exp(logits_pos) + torch.exp(logits_neg))).cpu().numpy()
 
+    result = evaluate(y_pred, y_true_val, val_labels)
     model.train()
     return result
 
@@ -873,19 +776,27 @@ def setup_test_dataset(test_cxr_filepath, test_label_path, labels, config):
     return test_loader, y_true_test
 
 def test_model_on_dataset(model, test_loader, y_true_test, labels, templates, device, config, dataset_name):
-    """Test model on a specific dataset and return results.
+    """Test model on a specific dataset using the original ("{}", "no {}") template.
 
-    Returns:
-        When prompt_ensemble is 'off' or 'on': a single DataFrame.
-        When prompt_ensemble is 'both': dict {"single": df, "ensemble": df}.
+    Returns a DataFrame of AUC results.
     """
     model.eval()
     context_length = getattr(model, 'context_length', config.context_length)
-    ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
 
     print(f"\n=== Testing on {dataset_name} ===")
 
-    # Extract image features once
+    # Compute text features
+    with torch.no_grad():
+        pos_texts = ["{}".format(c) for c in labels]
+        neg_texts = ["no {}".format(c) for c in labels]
+        pos_tokens = clip.tokenize(pos_texts, context_length).to(device)
+        neg_tokens = clip.tokenize(neg_texts, context_length).to(device)
+        pos_features = model.encode_text(pos_tokens)
+        neg_features = model.encode_text(neg_tokens)
+        pos_features = pos_features / pos_features.norm(dim=-1, keepdim=True)
+        neg_features = neg_features / neg_features.norm(dim=-1, keepdim=True)
+
+    # Extract image features
     all_img_feats = []
     with torch.no_grad():
         for batch in tqdm(test_loader, desc=f"Testing on {dataset_name}"):
@@ -895,49 +806,24 @@ def test_model_on_dataset(model, test_loader, y_true_test, labels, templates, de
             all_img_feats.append(feats.cpu())
     img_feats_cat = torch.cat(all_img_feats).to(device)
 
-    if ensemble_mode == 'off':
-        pos_f, neg_f = compute_text_features(model, labels, ["{}"], ["no {}"], context_length, device)
-        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
-        return evaluate(y_pred, y_true_test, labels)
-    elif ensemble_mode == 'on':
-        pos_f, neg_f = compute_text_features(model, labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
-        y_pred = _compute_predictions(img_feats_cat, pos_f, neg_f)
-        return evaluate(y_pred, y_true_test, labels)
-    else:  # 'both'
-        pos_s, neg_s = compute_text_features(model, labels, ["{}"], ["no {}"], context_length, device)
-        pos_e, neg_e = compute_text_features(model, labels, CXR_POS_TEMPLATES, CXR_NEG_TEMPLATES, context_length, device)
-        y_pred_s = _compute_predictions(img_feats_cat, pos_s, neg_s)
-        y_pred_e = _compute_predictions(img_feats_cat, pos_e, neg_e)
-        return {
-            "single": evaluate(y_pred_s, y_true_test, labels),
-            "ensemble": evaluate(y_pred_e, y_true_test, labels),
-        }
+    # Softmax evaluation
+    logits_pos = img_feats_cat @ pos_features.T
+    logits_neg = img_feats_cat @ neg_features.T
+    y_pred = (torch.exp(logits_pos) / (torch.exp(logits_pos) + torch.exp(logits_neg))).cpu().numpy()
 
-def _print_test_df(results_df, dataset_name, tag=""):
-    """Print AUC summary for a test results DataFrame."""
-    prefix = f"[{tag}] " if tag else ""
-    auc_cols = [col for col in results_df.columns if col.endswith('_auc')]
+    return evaluate(y_pred, y_true_test, labels)
+
+def _save_and_print_test_results(results, results_dir, dataset_prefix):
+    """Save and print test results."""
+    path = os.path.join(results_dir, f"{dataset_prefix}_test_results.csv")
+    results.to_csv(path, index=False)
+    print(f"{dataset_prefix.title()} test results saved to: {path}")
+    auc_cols = [col for col in results.columns if col.endswith('_auc')]
     if auc_cols:
-        mean_auc = results_df[auc_cols].mean().mean()
-        print(f"{prefix}{dataset_name} Mean AUC (all {len(auc_cols)} classes): {mean_auc:.4f}")
+        mean_auc = results[auc_cols].mean().mean()
+        print(f"{dataset_prefix.title()} Test Mean AUC (all {len(auc_cols)} classes): {mean_auc:.4f}")
         for col in auc_cols:
-            print(f"  {col}: {results_df[col].iloc[0]:.4f}")
-
-
-def _save_and_print_test_results(results, results_dir, dataset_prefix, ensemble_mode):
-    """Save and print test results, handling both single and dict (both) formats."""
-    if ensemble_mode == 'both':
-        for mode_name, df in results.items():
-            path = os.path.join(results_dir, f"{dataset_prefix}_test_results_{mode_name}.csv")
-            df.to_csv(path, index=False)
-            print(f"{dataset_prefix.title()} {mode_name} results saved to: {path}")
-            _print_test_df(df, f"{dataset_prefix.title()} Test", tag=mode_name.title())
-    else:
-        tag = "Ensemble" if ensemble_mode == 'on' else ""
-        path = os.path.join(results_dir, f"{dataset_prefix}_test_results.csv")
-        results.to_csv(path, index=False)
-        print(f"{dataset_prefix.title()} test results saved to: {path}")
-        _print_test_df(results, f"{dataset_prefix.title()} Test", tag=tag)
+            print(f"  {col}: {results[col].iloc[0]:.4f}")
 
 
 def run_final_testing(config):
@@ -965,8 +851,6 @@ def run_final_testing(config):
     
     results_dir = os.path.join(config.save_dir, config.model_name, "test_results")
     os.makedirs(results_dir, exist_ok=True)
-    
-    ensemble_mode = getattr(config, 'prompt_ensemble', 'off')
 
     # Test on CheXpert
     if os.path.exists(config.chexpert_test_cxr) and os.path.exists(config.chexpert_test_labels):
@@ -983,7 +867,7 @@ def run_final_testing(config):
             model, chexpert_loader, y_true_chexpert, chexpert_labels,
             chexpert_templates, device, config, "CheXpert Test")
 
-        _save_and_print_test_results(chexpert_results, results_dir, "chexpert", ensemble_mode)
+        _save_and_print_test_results(chexpert_results, results_dir, "chexpert")
 
     # Test on PadChest
     if os.path.exists(config.padchest_test_cxr) and os.path.exists(config.padchest_test_labels):
@@ -1004,7 +888,7 @@ def run_final_testing(config):
             model, padchest_loader, y_true_padchest, padchest_labels,
             padchest_templates, device, config, "PadChest Test")
 
-        _save_and_print_test_results(padchest_results, results_dir, "padchest", ensemble_mode)
+        _save_and_print_test_results(padchest_results, results_dir, "padchest")
     
     print("\n" + "="*60)
     print("FINAL TESTING COMPLETED")
