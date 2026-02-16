@@ -1,9 +1,12 @@
 import os
+import json
+import subprocess
 import argparse
 import h5py
 import pandas as pd
 import numpy as np
 from math import pi
+from datetime import datetime
 from tqdm import tqdm
 
 import clip
@@ -18,6 +21,34 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from eval import evaluate
 from train import load_data, load_clip, preprocess_text, setup_validation
+
+
+def save_config(config, save_dir):
+    """Save training configuration as JSON alongside checkpoints."""
+    config_dict = vars(config).copy()
+
+    # Add git hash
+    try:
+        git_hash = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL
+        ).decode('ascii').strip()
+    except Exception:
+        git_hash = "unknown"
+    config_dict['git_hash'] = git_hash
+
+    # Add timestamp
+    config_dict['timestamp'] = datetime.now().isoformat(timespec='seconds')
+
+    # Add effective batch size
+    num_gpus = int(os.environ.get('WORLD_SIZE', 1))
+    config_dict['effective_batch_size'] = (
+        config.batch_size * num_gpus * config.grad_accum_steps
+    )
+
+    path = os.path.join(save_dir, 'config.json')
+    with open(path, 'w') as f:
+        json.dump(config_dict, f, indent=2, default=str)
+    print(f"Config saved to {path}")
 
 
 class MultiCXRDataset(data.Dataset):
@@ -394,11 +425,18 @@ def ddp_main(config, verbose=0):
     if vit_variant:
         original_model_name = config.model_name
         config.model_name = f"{original_model_name}_{vit_variant}"
-        if rank == 0:  # Only print from main process
-            print(f"Using checkpoint folder: {config.model_name} (ViT variant: {vit_variant})")
-    else:
-        if rank == 0:
-            print(f"Using checkpoint folder: {config.model_name}")
+
+    # Append timestamp (rank 0 generates, shared via config ref before make())
+    if rank == 0:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        config.model_name = f"{config.model_name}_{timestamp}"
+        print(f"Using checkpoint folder: {config.model_name}")
+
+    # Broadcast timestamped model_name to all ranks
+    if dist.is_initialized():
+        name_list = [config.model_name] if rank == 0 else [None]
+        dist.broadcast_object_list(name_list, src=0)
+        config.model_name = name_list[0]
 
     # Auto batch size: rank 0 searches, then broadcasts to all ranks
     if config.auto_batch_size:
@@ -444,9 +482,11 @@ def single_gpu_pipeline(config, verbose=0):
     if vit_variant:
         original_model_name = config.model_name
         config.model_name = f"{original_model_name}_{vit_variant}"
-        print(f"Using checkpoint folder: {config.model_name} (ViT variant: {vit_variant})")
-    else:
-        print(f"Using checkpoint folder: {config.model_name}")
+
+    # Append timestamp to model_name
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    config.model_name = f"{config.model_name}_{timestamp}"
+    print(f"Using checkpoint folder: {config.model_name}")
 
     # Auto batch size: find optimal before loading data
     if config.auto_batch_size:
@@ -549,6 +589,7 @@ def train(model, loader, device, criterion, optimizer, scheduler, scaler, config
         
         model_save_dir = os.path.join(config.save_dir, config.model_name)
         os.makedirs(model_save_dir, exist_ok=True)
+        save_config(config, model_save_dir)
 
         # Initialize validation log file with all 14 CheXpert classes
         val_log_path = os.path.join(model_save_dir, "validation_log.txt")
