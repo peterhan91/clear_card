@@ -93,7 +93,7 @@ TEST_AFTER="${TEST_AFTER:-0}"
 EARLY_STOPPING="${EARLY_STOPPING:-1}"
 
 # Auto batch size (set AUTO_BS=1 to enable automatic batch size discovery)
-AUTO_BS="${AUTO_BS:-0}"
+AUTO_BS="${AUTO_BS:-1}"
 
 echo "========================================"
 echo "CXR CLIP Training Job"
