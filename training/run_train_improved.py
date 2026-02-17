@@ -246,14 +246,26 @@ def parse_args():
     return args
 
 def _try_batch_size(model, device, batch_size, img_resolution, context_length):
-    """Run one forward+backward pass with dummy data to test if batch_size fits in GPU memory.
+    """Run one forward+backward+optimizer step with dummy data to test if batch_size fits.
+
+    Includes optimizer step to account for AdamW state memory (momentum + variance),
+    which can add significant overhead for large models.
 
     Returns:
         (success, peak_memory_bytes): Whether the batch fit, and peak GPU memory used.
     """
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.empty_cache()
+    optimizer = None
+    scaler = None
     try:
+        # Create optimizer + scaler to measure true training memory (AdamW states + GradScaler)
+        optimizer = optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=1e-4, weight_decay=0.01,
+        )
+        scaler = torch.amp.GradScaler("cuda")
+
         dummy_imgs = torch.randn(batch_size, 3, img_resolution, img_resolution, device=device)
         dummy_texts = torch.randint(0, 49408, (batch_size, context_length), device=device)
         with torch.amp.autocast('cuda'):
@@ -261,14 +273,21 @@ def _try_batch_size(model, device, batch_size, img_resolution, context_length):
             labels = torch.arange(batch_size, device=device)
             loss = (nn.functional.cross_entropy(logits_per_image, labels) +
                     nn.functional.cross_entropy(logits_per_text, labels)) / 2
-        loss.backward()
-        model.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
         peak_mem = torch.cuda.max_memory_allocated(device)
         del dummy_imgs, dummy_texts, logits_per_image, logits_per_text, labels, loss
+        del optimizer, scaler
         torch.cuda.empty_cache()
         return True, peak_mem
     except torch.cuda.OutOfMemoryError:
         model.zero_grad(set_to_none=True)
+        if optimizer is not None:
+            del optimizer
+        if scaler is not None:
+            del scaler
         torch.cuda.empty_cache()
         return False, 0
 
