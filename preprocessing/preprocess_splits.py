@@ -30,7 +30,7 @@ REXGRADIENT_NEW_PREFIX = "/cbica/projects/CXR/data/RexGradient/data/images"
 
 
 def fix_chexpert_path(path: str, image_root: str) -> str:
-    """Fix CheXpert path: join with image_root and convert .jpg to .png.
+    """Fix CheXpert path: join with image_root and resolve file extension.
 
     Also handles the CheXpert-v1.0/ prefix in valid/test CSVs:
     - Train CSV: 'train/patient.../...'
@@ -38,15 +38,21 @@ def fix_chexpert_path(path: str, image_root: str) -> str:
     - Test CSV: 'CheXpert-v1.0/test/patient.../...'
 
     Disk structure is: {image_root}/train/... or {image_root}/valid/... or {image_root}/test/...
+
+    Note: Train/valid images are .png on disk, but test images are .jpg.
+    We try .png first (most common), then fall back to .jpg.
     """
     # Strip CheXpert-v1.0/ prefix if present (valid/test CSVs have this)
     if path.startswith('CheXpert-v1.0/'):
         path = path[len('CheXpert-v1.0/'):]
 
     full_path = os.path.join(image_root, path)
-    # CSV has .jpg but actual files are .png
+    # CSV paths use .jpg; train/valid are .png on disk, test are .jpg
     if full_path.endswith('.jpg'):
-        full_path = full_path[:-4] + '.png'
+        png_path = full_path[:-4] + '.png'
+        if os.path.exists(png_path):
+            return png_path
+        # Fall back to original .jpg if .png doesn't exist (e.g., test set)
     return full_path
 
 
