@@ -248,8 +248,9 @@ def parse_args():
 def _try_batch_size(model, device, batch_size, img_resolution, context_length):
     """Run one forward+backward+optimizer step with dummy data to test if batch_size fits.
 
-    Includes optimizer step to account for AdamW state memory (momentum + variance),
-    which can add significant overhead for large models.
+    Includes a real optimizer.step() (without GradScaler, which can silently skip
+    on inf/nan gradients from random data) to account for AdamW state memory
+    (momentum + variance buffers), which adds significant overhead for large models.
 
     Returns:
         (success, peak_memory_bytes): Whether the batch fit, and peak GPU memory used.
@@ -257,14 +258,15 @@ def _try_batch_size(model, device, batch_size, img_resolution, context_length):
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.empty_cache()
     optimizer = None
-    scaler = None
     try:
-        # Create optimizer + scaler to measure true training memory (AdamW states + GradScaler)
+        # Create optimizer to measure true training memory (AdamW states)
+        # NOTE: Do NOT use GradScaler here — it silently skips optimizer.step()
+        # when random data produces inf/nan gradients, leaving optimizer states
+        # unallocated and making the memory estimate too optimistic.
         optimizer = optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=1e-4, weight_decay=0.01,
         )
-        scaler = torch.amp.GradScaler("cuda")
 
         dummy_imgs = torch.randn(batch_size, 3, img_resolution, img_resolution, device=device)
         dummy_texts = torch.randint(0, 49408, (batch_size, context_length), device=device)
@@ -273,21 +275,18 @@ def _try_batch_size(model, device, batch_size, img_resolution, context_length):
             labels = torch.arange(batch_size, device=device)
             loss = (nn.functional.cross_entropy(logits_per_image, labels) +
                     nn.functional.cross_entropy(logits_per_text, labels)) / 2
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         peak_mem = torch.cuda.max_memory_allocated(device)
         del dummy_imgs, dummy_texts, logits_per_image, logits_per_text, labels, loss
-        del optimizer, scaler
+        del optimizer
         torch.cuda.empty_cache()
         return True, peak_mem
     except torch.cuda.OutOfMemoryError:
         model.zero_grad(set_to_none=True)
         if optimizer is not None:
             del optimizer
-        if scaler is not None:
-            del scaler
         torch.cuda.empty_cache()
         return False, 0
 
@@ -357,7 +356,9 @@ def _binary_search_batch_size(model, device, img_resolution, context_length,
 def find_optimal_batch_size(config, rank=0):
     """Load a temporary model, run binary search for max batch size, clean up.
 
-    Uses 90% GPU RAM target for both DDP and single GPU.
+    Uses 85% GPU RAM target for DDP (to reserve headroom for DDP gradient
+    buckets and NCCL communication buffers not present in the standalone test),
+    90% for single GPU.
     """
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
@@ -385,7 +386,8 @@ def find_optimal_batch_size(config, rank=0):
     pretrained = not config.random_init
     img_resolution = 448 if (pretrained or config.use_dinov3) else 320
 
-    target = 0.90
+    # DDP adds gradient buckets + NCCL buffers not present in standalone test
+    target = 0.85 if config.use_ddp else 0.90
     optimal_bs = _binary_search_batch_size(
         model, device, img_resolution, config.context_length,
         target_fraction=target, initial_bs=8,
