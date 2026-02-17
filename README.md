@@ -27,7 +27,8 @@ clear_card/
 │   ├── run_train.py               # Basic single-GPU training
 │   └── run_train_improved.py      # Advanced training (DDP, validation, early stopping)
 ├── slurm_preprocess.sh            # Slurm preprocessing job
-└── slurm_train.sh                 # Slurm training job
+├── slurm_train.sh                 # Slurm training job (single experiment)
+└── launch_dinov3_sweep.sh         # Submit 3 dataset sweep jobs for DINOv3 + LoRA
 ```
 
 ## Cluster Data Layout (CUBIC)
@@ -123,8 +124,51 @@ USE_DINOV3=1 sbatch slurm_train.sh
 # With DINOv3 ViT-L/16
 USE_DINOV3=1 DINOV3_MODEL=dinov3_vitl16 sbatch slurm_train.sh
 
+# DINOv3 ViT-H+ with LoRA
+USE_DINOV3=1 DINOV3_MODEL=dinov3_vith16plus USE_LORA=1 sbatch slurm_train.sh
+
+# DINOv3 ViT-7B with LoRA (LoRA required for this model)
+USE_DINOV3=1 DINOV3_MODEL=dinov3_vit7b16 USE_LORA=1 LORA_RANK=16 sbatch slurm_train.sh
+
 # Multi-dataset (CheXpert-Plus + ReXGradient)
 USE_MULTI=1 sbatch slurm_train.sh
+```
+
+### Dataset Sweep (DINOv3 + LoRA)
+
+`launch_dinov3_sweep.sh` submits 3 SLURM jobs in one command -- combined, CheXpert-only, and ReXGradient-only -- all with validation, early stopping, and final testing to find the best model.
+
+```bash
+# ViT-H+ with LoRA rank 16 (default)
+./launch_dinov3_sweep.sh --model dinov3_vith16plus
+
+# ViT-7B with LoRA rank 32
+./launch_dinov3_sweep.sh --model dinov3_vit7b16 --lora_rank 32 --lora_alpha 64
+
+# ViT-H+ full finetune (no LoRA)
+./launch_dinov3_sweep.sh --model dinov3_vith16plus --no_lora
+
+# Preview commands without submitting
+./launch_dinov3_sweep.sh --model dinov3_vit7b16 --dry_run
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | `dinov3_vith16plus` | DINOv3 variant |
+| `--no_lora` | off | Disable LoRA (not allowed for vit7b16) |
+| `--lora_rank` | `16` | LoRA rank |
+| `--lora_alpha` | `32` | LoRA alpha |
+| `--lora_dropout` | `0.05` | LoRA dropout |
+| `--lora_targets` | auto-detect | Target modules (space-separated) |
+| `--epochs` | `40` | Training epochs |
+| `--lr` | `1e-4` | Learning rate |
+| `--grad_accum` | `1` | Gradient accumulation steps |
+| `--seed` | `1234` | Random seed |
+| `--dry_run` | off | Print commands without submitting |
+
+Each job saves `best_model.pt` (by validation AUC) and runs final zero-shot test. Results are in:
+```
+checkpoints/dinov3-{vit_tag}-{lora_tag}-{combined,chexpert,rexgradient}_*/test_results/
 ```
 
 ### Command Line
@@ -161,17 +205,26 @@ python training/run_train_improved.py \
     --cxr_filepath /cbica/projects/CXR/data_p/chexpert-plus/chexpert_plus_train.h5 \
     --txt_filepath /cbica/projects/CXR/data_p/chexpert-plus/chexpert_plus_train_metadata.csv \
     --do_validate --early_stopping
+
+# DINOv3 ViT-H+ with LoRA adapters
+python training/run_train_improved.py \
+    --use_dinov3 --dinov3_model_name dinov3_vith16plus \
+    --use_lora --lora_rank 16 --lora_alpha 32 \
+    --cxr_filepath /cbica/projects/CXR/data_p/chexpert-plus/chexpert_plus_train.h5 \
+    --txt_filepath /cbica/projects/CXR/data_p/chexpert-plus/chexpert_plus_train_metadata.csv \
+    --do_validate --early_stopping --auto_batch_size
 ```
 
 ### Training Arguments (run_train_improved.py)
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--cxr_filepath` | `.../chexpert-plus/chexpert_plus_train.h5` | Training H5 images |
-| `--txt_filepath` | `.../chexpert-plus/chexpert_plus_train_metadata.csv` | Training metadata CSV |
+| `--cxr_filepath` | `.../chexpert_plus_train.h5` | Training H5 images |
+| `--txt_filepath` | `.../chexpert_plus_train_metadata.csv` | Training metadata CSV |
 | `--use_multi_datasets` | off | Train on multiple datasets |
 | `--dataset_paths` | CheXpert+ReXGradient | `img.h5,text.csv` pairs |
 | `--batch_size` | `64` | Batch size per GPU |
+| `--auto_batch_size` | off | Auto-find max batch size (90% GPU RAM) |
 | `--epochs` | `40` | Max training epochs |
 | `--lr` | `1e-4` | Learning rate |
 | `--weight_decay` | `0.2` | AdamW weight decay |
@@ -179,14 +232,25 @@ python training/run_train_improved.py \
 | `--grad_accum_steps` | `4` | Gradient accumulation steps |
 | `--do_validate` | off | Validate during training |
 | `--early_stopping` | off | Enable early stopping |
-| `--patience` | `5` | Early stopping patience |
-| `--use_dinov3` | off | Use DINOv3 vision encoder |
-| `--dinov3_model_name` | `dinov3_vitb16` | DINOv3 variant |
-| `--dinov3_repo_dir` | `/cbica/.../dinov3` | Path to local DINOv3 repo |
-| `--dinov3_weights` | `.../dinov3_vitb16_...pth` | Path to DINOv3 weights |
-| `--freeze_dinov3` | off | Freeze DINOv3 backbone |
+| `--patience` | `20` | Early stopping patience (validation intervals) |
 | `--use_ddp` | off | Multi-GPU DDP training |
 | `--test_after_training` | off | Run zero-shot test after training |
+| **DINOv3** | | |
+| `--use_dinov3` | off | Use DINOv3 vision encoder |
+| `--dinov3_model_name` | `dinov3_vitb16` | DINOv3 variant (`vits16`, `vits16plus`, `vitb16`, `vitl16`, `vith16plus`, `vit7b16`) |
+| `--dinov3_repo_dir` | `/cbica/.../dinov3` | Path to local DINOv3 repo |
+| `--dinov3_weights` | `.../dinov3_vitb16_...pth` | Path to DINOv3 weights |
+| `--freeze_dinov3` | off | Freeze DINOv3 backbone (ignored if LoRA enabled) |
+| **LoRA** | | |
+| `--use_lora` | off | Apply LoRA adapters to DINOv3 backbone |
+| `--lora_rank` | `16` | LoRA rank |
+| `--lora_alpha` | `32` | LoRA alpha scaling factor |
+| `--lora_dropout` | `0.05` | LoRA dropout rate |
+| `--lora_target_modules` | auto-detect | Module names to apply LoRA to (auto-detects `qkv`, `proj`, `fc1`, `fc2`) |
+
+**Note:** `dinov3_vit7b16` (6.7B params) requires `--use_lora` -- full finetuning is not supported for this model.
+
+**LoRA-optimized defaults:** When `--use_lora` is enabled, weight decay is automatically reduced from 0.2 to 0.01 and warmup steps from 250 to 100 (unless explicitly overridden). High weight decay over-regularizes LoRA adapters toward the frozen base weights.
 
 ### Note on Multi-Dataset Column Names
 
@@ -203,10 +267,11 @@ df.to_csv('/cbica/projects/CXR/data_p/rexgradient/rexgradient_train_metadata.csv
 
 ### Model Architecture
 
-- **Vision**: ViT-B/16 (12 layers, 768 width, 16px patches) or DINOv3
+- **Vision**: ViT-B/16 (12 layers, 768 width, 16px patches) or DINOv3 (ViT-S/B/L/H/7B)
 - **Text**: Transformer (12 layers, 512 width, 8 heads, context length 77)
 - **Embedding**: 768-dim shared space
 - **Loss**: Symmetric contrastive (CrossEntropy on image-text similarity matrix)
+- **LoRA**: Optional low-rank adapters on DINOv3 backbone (~0.2% trainable params for 7B model)
 
 ## Preprocessing Pipeline
 
@@ -249,4 +314,5 @@ scipy
 ftfy
 regex
 matplotlib
+peft          # Required for LoRA (pip install peft)
 ```

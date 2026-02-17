@@ -69,6 +69,14 @@ DINOV3_REPO_DIR="${DINOV3_REPO_DIR:-/cbica/projects/CXR/codes/dinov3}"
 DINOV3_WEIGHTS_DIR="${DINOV3_WEIGHTS_DIR:-${DINOV3_REPO_DIR}/checkpoints}"
 FREEZE_DINOV3="${FREEZE_DINOV3:-0}"
 
+# LoRA options (set USE_LORA=1 to enable LoRA adapters on DINOv3 backbone)
+USE_LORA="${USE_LORA:-0}"
+LORA_RANK="${LORA_RANK:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+# Space-separated list of module names, or empty for auto-detect
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-}"
+
 # Map model name to weights file
 declare -A DINOV3_WEIGHT_MAP=(
     ["dinov3_vits16"]="dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
@@ -106,6 +114,7 @@ echo "DDP:             $USE_DDP (${NUM_GPUS} GPUs)"
 echo "Multi-dataset:   $USE_MULTI"
 echo "Validation:      $DO_VALIDATE"
 echo "DINOv3:          $USE_DINOV3 ($DINOV3_MODEL)"
+echo "LoRA:            $USE_LORA (rank=$LORA_RANK, alpha=$LORA_ALPHA)"
 echo "Auto batch size: $AUTO_BS"
 echo "Batch size:      $BATCH_SIZE per GPU"
 echo "Grad accum:      $GRAD_ACCUM"
@@ -161,6 +170,12 @@ if [ "$TRAIN_SCRIPT" == "run_train_improved" ]; then
         ARGS="$ARGS --use_dinov3 --dinov3_model_name $DINOV3_MODEL --dinov3_repo_dir $DINOV3_REPO_DIR --dinov3_weights $DINOV3_WEIGHTS"
         if [ "$FREEZE_DINOV3" == "1" ]; then
             ARGS="$ARGS --freeze_dinov3"
+        fi
+        if [ "$USE_LORA" == "1" ]; then
+            ARGS="$ARGS --use_lora --lora_rank $LORA_RANK --lora_alpha $LORA_ALPHA --lora_dropout $LORA_DROPOUT"
+            if [ -n "$LORA_TARGET_MODULES" ]; then
+                ARGS="$ARGS --lora_target_modules $LORA_TARGET_MODULES"
+            fi
         fi
     fi
 

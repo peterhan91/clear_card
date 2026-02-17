@@ -226,6 +226,13 @@ def parse_args():
                         default='/cbica/projects/CXR/codes/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
                         help='Path to DINOv3 pretrained weights')
     parser.add_argument('--freeze_dinov3', action='store_true', help='Freeze DINOv3 backbone weights')
+    # LoRA arguments
+    parser.add_argument('--use_lora', action='store_true', help='Apply LoRA adapters to DINOv3 backbone')
+    parser.add_argument('--lora_rank', type=int, default=16, help='LoRA rank (default: 16)')
+    parser.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha scaling factor (default: 32)')
+    parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout rate (default: 0.05)')
+    parser.add_argument('--lora_target_modules', type=str, nargs='+', default=None,
+                        help='Module names to apply LoRA to (default: auto-detect attention layers)')
     # Early stopping arguments
     parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
     parser.add_argument('--patience', type=int, default=20, help='Number of epochs to wait without improvement before stopping')
@@ -331,7 +338,7 @@ def _binary_search_batch_size(model, device, img_resolution, context_length,
 def find_optimal_batch_size(config, rank=0):
     """Load a temporary model, run binary search for max batch size, clean up.
 
-    Uses 85% target for DDP (headroom for communication buffers), 90% for single GPU.
+    Uses 90% GPU RAM target for both DDP and single GPU.
     """
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
@@ -346,6 +353,11 @@ def find_optimal_batch_size(config, rank=0):
         dinov3_repo_dir=config.dinov3_repo_dir,
         dinov3_weights=config.dinov3_weights,
         freeze_dinov3=config.freeze_dinov3,
+        use_lora=config.use_lora,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        lora_target_modules=config.lora_target_modules,
     )
     model.to(device)
     model.train()
@@ -354,7 +366,7 @@ def find_optimal_batch_size(config, rank=0):
     pretrained = not config.random_init
     img_resolution = 448 if (pretrained or config.use_dinov3) else 320
 
-    target = 0.85 if config.use_ddp else 0.90
+    target = 0.90
     optimal_bs = _binary_search_batch_size(
         model, device, img_resolution, config.context_length,
         target_fraction=target, initial_bs=8,
@@ -550,10 +562,15 @@ def make(config, rank=0):
         dinov3_model_name=config.dinov3_model_name,
         dinov3_repo_dir=config.dinov3_repo_dir,
         dinov3_weights=config.dinov3_weights,
-        freeze_dinov3=config.freeze_dinov3
+        freeze_dinov3=config.freeze_dinov3,
+        use_lora=config.use_lora,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        lora_target_modules=config.lora_target_modules,
     )
     model.to(device)
-    
+
     # Wrap model with DDP if enabled
     if config.use_ddp:
         model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
@@ -563,7 +580,10 @@ def make(config, rank=0):
 
     criterion = nn.CrossEntropyLoss().cuda()
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.999)
+    )
 
     total_steps = config.epochs * len(data_loader)
     if config.lr_schedule == 'cosine':
@@ -885,7 +905,12 @@ def run_final_testing(config):
         dinov3_model_name=config.dinov3_model_name,
         dinov3_repo_dir=config.dinov3_repo_dir,
         dinov3_weights=config.dinov3_weights,
-        freeze_dinov3=config.freeze_dinov3
+        freeze_dinov3=config.freeze_dinov3,
+        use_lora=config.use_lora,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        lora_target_modules=config.lora_target_modules,
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -939,4 +964,13 @@ def run_final_testing(config):
 
 if __name__ == "__main__":
     args = parse_args()
+    # Apply LoRA-optimized defaults: lower weight decay and warmup steps
+    # (high weight_decay over-regularizes LoRA adapters toward base weights)
+    if args.use_lora:
+        if args.weight_decay == 0.2:
+            args.weight_decay = 0.01
+            print(f"[LoRA] Using weight_decay=0.01 (override from 0.2 for LoRA)")
+        if args.warmup_steps == 250:
+            args.warmup_steps = 100
+            print(f"[LoRA] Using warmup_steps=100 (override from 250 for LoRA)")
     model = model_pipeline(args)

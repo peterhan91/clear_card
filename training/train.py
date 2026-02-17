@@ -18,6 +18,12 @@ import clip
 from model import CLIP
 from simple_tokenizer import SimpleTokenizer
 
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError:
+    LoraConfig = None
+    get_peft_model = None
+
 class CXRDataset(data.Dataset):
     """Represents an abstract HDF5 dataset.
     
@@ -114,7 +120,9 @@ def load_clip(model_path=None, pretrained=False, context_length=77,
               use_dinov3=False, dinov3_model_name="dinov3_vitb16",
               dinov3_repo_dir="/cbica/projects/CXR/codes/dinov3",
               dinov3_weights="/cbica/projects/CXR/codes/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-              freeze_dinov3=False):
+              freeze_dinov3=False,
+              use_lora=False, lora_rank=16, lora_alpha=32, lora_dropout=0.05,
+              lora_target_modules=None):
     '''
     FUNCTION: load_clip
     -------------------------------
@@ -133,6 +141,12 @@ def load_clip(model_path=None, pretrained=False, context_length=77,
         * dinov3_repo_dir (optional) - path to local DINOv3 repo
         * dinov3_weights (optional) - path to DINOv3 pretrained weights
         * freeze_dinov3 (optional) - if True, freeze DINOv3 backbone
+        * use_lora (optional) - if True, apply LoRA adapters to DINOv3 backbone
+        * lora_rank (optional) - LoRA rank
+        * lora_alpha (optional) - LoRA alpha scaling factor
+        * lora_dropout (optional) - LoRA dropout rate
+        * lora_target_modules (optional) - list of module names to apply LoRA to;
+          if None, auto-detects attention linear layers
     '''
 
     params = {
@@ -160,12 +174,65 @@ def load_clip(model_path=None, pretrained=False, context_length=77,
 
         # Replace visual encoder with DINOv3 if requested
         if use_dinov3:
+            # Enforce LoRA for vit7b16 (too large for full finetune)
+            if dinov3_model_name == 'dinov3_vit7b16' and not use_lora:
+                raise ValueError(
+                    "dinov3_vit7b16 (6.7B params) is too large for full finetuning. "
+                    "Please enable LoRA with --use_lora."
+                )
+
             # Load DINOv3 backbone from local repo
             dinov3_backbone = torch.hub.load(
                 dinov3_repo_dir, dinov3_model_name,
                 source='local', weights=dinov3_weights
             )
             dinov3_backbone = dinov3_backbone.to(device)
+
+            # Apply LoRA if requested
+            if use_lora:
+                if get_peft_model is None:
+                    raise ImportError(
+                        "peft is required for LoRA support. "
+                        "Install it with: pip install peft"
+                    )
+
+                if freeze_dinov3:
+                    print("Warning: --freeze_dinov3 is ignored when --use_lora is enabled "
+                          "(LoRA already freezes base parameters).")
+
+                # Auto-detect target modules if not specified
+                if lora_target_modules is None:
+                    detected = []
+                    for name, module in dinov3_backbone.named_modules():
+                        if isinstance(module, nn.Linear):
+                            # Target attention linear layers (qkv, proj, fc patterns)
+                            short = name.split('.')[-1]
+                            if short in ('qkv', 'proj', 'fc1', 'fc2'):
+                                detected.append(name)
+                    # Deduplicate while preserving order
+                    seen = set()
+                    lora_target_modules = []
+                    for n in detected:
+                        if n not in seen:
+                            seen.add(n)
+                            lora_target_modules.append(n)
+                    print(f"[LoRA] Auto-detected target modules ({len(lora_target_modules)}): "
+                          f"{lora_target_modules[:10]}{'...' if len(lora_target_modules) > 10 else ''}")
+
+                lora_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    target_modules=lora_target_modules,
+                    bias="none",
+                )
+                dinov3_backbone = get_peft_model(dinov3_backbone, lora_config)
+
+                # Print trainable vs total param counts
+                trainable = sum(p.numel() for p in dinov3_backbone.parameters() if p.requires_grad)
+                total = sum(p.numel() for p in dinov3_backbone.parameters())
+                print(f"[LoRA] Trainable params: {trainable:,} / {total:,} "
+                      f"({100 * trainable / total:.2f}%)")
 
             # Get feature dimension using a dummy forward pass
             with torch.no_grad():
@@ -192,12 +259,13 @@ def load_clip(model_path=None, pretrained=False, context_length=77,
             # Replace visual encoder
             model.visual = DINOv3Visual(dinov3_backbone, backbone_dim, params['embed_dim'])
 
-            # Freeze backbone if requested
-            if freeze_dinov3:
+            # Freeze backbone if requested (skip if LoRA is handling freezing)
+            if freeze_dinov3 and not use_lora:
                 for param in model.visual.backbone.parameters():
                     param.requires_grad = False
 
-            print(f"Loaded CLIP model with DINOv3 vision encoder: {dinov3_model_name}")
+            print(f"Loaded CLIP model with DINOv3 vision encoder: {dinov3_model_name}"
+                  f"{' + LoRA' if use_lora else ''}")
         else:
             print("Loaded in clip model.")
     
