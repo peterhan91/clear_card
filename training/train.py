@@ -18,11 +18,7 @@ import clip
 from model import CLIP
 from simple_tokenizer import SimpleTokenizer
 
-try:
-    from peft import LoraConfig, get_peft_model
-except ImportError:
-    LoraConfig = None
-    get_peft_model = None
+# peft is imported lazily inside load_clip() when use_lora=True
 
 class CXRDataset(data.Dataset):
     """Represents an abstract HDF5 dataset.
@@ -190,11 +186,7 @@ def load_clip(model_path=None, pretrained=False, context_length=77,
 
             # Apply LoRA if requested
             if use_lora:
-                if get_peft_model is None:
-                    raise ImportError(
-                        "peft is required for LoRA support. "
-                        "Install it with: pip install peft"
-                    )
+                from peft import LoraConfig, get_peft_model
 
                 if freeze_dinov3:
                     print("Warning: --freeze_dinov3 is ignored when --use_lora is enabled "

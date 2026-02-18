@@ -23,11 +23,7 @@ import clip
 from model import CLIP
 from eval import evaluate, plot_roc, accuracy, sigmoid, bootstrap, compute_cis
 
-try:
-    from peft import LoraConfig, get_peft_model
-except ImportError:
-    LoraConfig = None
-    get_peft_model = None
+# peft is imported lazily inside load_clip() when use_lora=True
 
 
 class CXRTestDataset(data.Dataset):
@@ -106,11 +102,7 @@ def load_clip(model_path, pretrained=False, context_length=77,
 
             # Apply LoRA if requested
             if use_lora:
-                if get_peft_model is None:
-                    raise ImportError(
-                        "peft is required for LoRA support. "
-                        "Install it with: pip install peft"
-                    )
+                from peft import LoraConfig, get_peft_model
 
                 # Auto-detect target modules if not specified
                 if lora_target_modules is None:
