@@ -180,6 +180,8 @@ submit_job() {
         result=$(eval "$cmd")
         echo "  $result"
         echo ""
+        echo "  Waiting 10s before next submission..."
+        sleep 10
     fi
 }
 
