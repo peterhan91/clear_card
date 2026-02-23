@@ -56,6 +56,7 @@ EPOCHS="${EPOCHS:-40}"
 LR="${LR:-1e-4}"
 SEED="${SEED:-1234}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
 
 # DDP options (set USE_DDP=1 to enable 2-GPU distributed training)
 USE_DDP="${USE_DDP:-1}"
@@ -102,6 +103,9 @@ EARLY_STOPPING="${EARLY_STOPPING:-1}"
 
 # Auto batch size (set AUTO_BS=1 to enable automatic batch size discovery)
 AUTO_BS="${AUTO_BS:-1}"
+# Target effective batch size (0 = auto: BATCH_SIZE * NUM_GPUS * GRAD_ACCUM)
+# When AUTO_BS finds a smaller per-GPU batch, grad_accum is auto-increased to reach this target
+TARGET_EFF_BS="${TARGET_EFF_BS:-256}"
 
 echo "========================================"
 echo "CXR CLIP Training Job"
@@ -116,9 +120,11 @@ echo "Validation:      $DO_VALIDATE"
 echo "DINOv3:          $USE_DINOV3 ($DINOV3_MODEL)"
 echo "LoRA:            $USE_LORA (rank=$LORA_RANK, alpha=$LORA_ALPHA)"
 echo "Auto batch size: $AUTO_BS"
-echo "Batch size:      $BATCH_SIZE per GPU"
-echo "Grad accum:      $GRAD_ACCUM"
-echo "Effective batch: $((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM))"
+echo "Target eff BS:   $TARGET_EFF_BS (0=auto: BS*GPUs*accum)"
+echo "Batch size:      $BATCH_SIZE per GPU (initial, may be adjusted by auto BS)"
+echo "Grad accum:      $GRAD_ACCUM (initial, auto-adjusted when auto BS is enabled)"
+echo "Grad clip norm:  $GRAD_CLIP_NORM"
+echo "Configured eff:  $((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM))"
 echo "Epochs:          $EPOCHS"
 echo "LR:              $LR"
 echo "Save dir:        $SAVE_DIR"
@@ -137,6 +143,7 @@ ARGS="--cxr_filepath $CXR_FILEPATH \
 
 if [ "$TRAIN_SCRIPT" == "run_train_improved" ]; then
     ARGS="$ARGS \
+        --grad_clip_norm $GRAD_CLIP_NORM \
         --val_cxr_filepath $VAL_CXR \
         --val_label_path $VAL_LABELS \
         --chexpert_test_cxr $TEST_CXR \
@@ -164,6 +171,9 @@ if [ "$TRAIN_SCRIPT" == "run_train_improved" ]; then
 
     if [ "$AUTO_BS" == "1" ]; then
         ARGS="$ARGS --auto_batch_size"
+        if [ "$TARGET_EFF_BS" != "0" ]; then
+            ARGS="$ARGS --target_effective_batch_size $TARGET_EFF_BS"
+        fi
     fi
 
     if [ "$USE_DINOV3" == "1" ]; then

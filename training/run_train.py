@@ -126,12 +126,14 @@ def train_batch(images, texts, model, device, criterion, optimizer):
     images, texts = images.to(device), texts.to(device)
     
     # Forward pass ➡
-    logits_per_image, logits_per_text = model(images, texts)
-    
+    image_features, text_features, logit_scale = model(images, texts)
+    logits_per_image = logit_scale * image_features @ text_features.t()
+    logits_per_text = logit_scale * text_features @ image_features.t()
+
     # Create labels
     batch_size = images.shape[0]
     labels = torch.arange(batch_size).to(device)
-    
+
     # Compute loss
     loss_img = criterion(logits_per_image, labels)
     loss_txt = criterion(logits_per_text, labels)
