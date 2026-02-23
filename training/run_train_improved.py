@@ -279,7 +279,7 @@ def parse_args():
     parser.add_argument('--early_stopping_metric', type=str, default='mean_auc', 
                         choices=['mean_auc', 'loss'], help='Metric to use for early stopping')
     # Stability arguments
-    parser.add_argument('--grad_clip_norm', type=float, default=1.0,
+    parser.add_argument('--grad_clip_norm', type=float, default=0,
                         help='Max gradient norm for clipping (0 to disable)')
     # DDP arguments
     parser.add_argument('--use_ddp', action='store_true', help='Use Distributed Data Parallel training')

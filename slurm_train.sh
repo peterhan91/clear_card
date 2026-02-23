@@ -56,7 +56,7 @@ EPOCHS="${EPOCHS:-40}"
 LR="${LR:-1e-4}"
 SEED="${SEED:-1234}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0}"
 
 # DDP options (set USE_DDP=1 to enable 2-GPU distributed training)
 USE_DDP="${USE_DDP:-1}"
