@@ -1,9 +1,7 @@
 import os
-import math
 import json
 import subprocess
 import argparse
-from contextlib import nullcontext
 import h5py
 import pandas as pd
 import numpy as np
@@ -23,39 +21,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from eval import evaluate
 from train import load_data, load_clip, preprocess_text, setup_validation
-
-
-def gather_features(features, world_size):
-    """Gather features from all GPUs, preserving gradients for the local rank.
-
-    Uses the EVA-CLIP/OpenCLIP pattern: all_gather produces non-differentiable
-    copies, then we replace the current rank's slice with the original tensor
-    so gradients flow through local features only.
-    """
-    if world_size <= 1:
-        return features
-    gathered = [torch.zeros_like(features) for _ in range(world_size)]
-    dist.all_gather(gathered, features)
-    # Replace current rank's copy with the original (gradient-bearing) tensor
-    gathered[dist.get_rank()] = features
-    return torch.cat(gathered, dim=0)
-
-
-def clip_contrastive_loss(image_features, text_features, logit_scale, world_size):
-    """Compute CLIP contrastive loss with cross-GPU gathered features."""
-    # Gather features across all GPUs
-    all_image_features = gather_features(image_features, world_size)
-    all_text_features = gather_features(text_features, world_size)
-
-    # Compute similarity matrices
-    logits_per_image = logit_scale * all_image_features @ all_text_features.t()
-    logits_per_text = logit_scale * all_text_features @ all_image_features.t()
-
-    # Labels: diagonal is the positive pair
-    labels = torch.arange(logits_per_image.shape[0], device=image_features.device)
-    loss = (nn.functional.cross_entropy(logits_per_image, labels) +
-            nn.functional.cross_entropy(logits_per_text, labels)) / 2
-    return loss
 
 
 def save_config(config, save_dir):
@@ -221,10 +186,6 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--auto_batch_size', action='store_true',
                         help='Automatically find the largest batch size that fits in ~90%% GPU RAM')
-    parser.add_argument('--target_effective_batch_size', type=int, default=0,
-                        help='Target effective batch size for auto_batch_size. When auto BS finds a '
-                             'smaller per-GPU batch, grad_accum_steps is auto-computed to reach this '
-                             'target. If 0 (default), uses batch_size * num_gpus * grad_accum_steps.')
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.2)
@@ -278,9 +239,6 @@ def parse_args():
     parser.add_argument('--min_delta', type=float, default=0.001, help='Minimum change to qualify as an improvement')
     parser.add_argument('--early_stopping_metric', type=str, default='mean_auc', 
                         choices=['mean_auc', 'loss'], help='Metric to use for early stopping')
-    # Stability arguments
-    parser.add_argument('--grad_clip_norm', type=float, default=0,
-                        help='Max gradient norm for clipping (0 to disable)')
     # DDP arguments
     parser.add_argument('--use_ddp', action='store_true', help='Use Distributed Data Parallel training')
     parser.add_argument('--backend', type=str, default='nccl', help='DDP backend')
@@ -313,9 +271,7 @@ def _try_batch_size(model, device, batch_size, img_resolution, context_length):
         dummy_imgs = torch.randn(batch_size, 3, img_resolution, img_resolution, device=device)
         dummy_texts = torch.randint(0, 49408, (batch_size, context_length), device=device)
         with torch.amp.autocast('cuda'):
-            image_features, text_features, logit_scale = model(dummy_imgs, dummy_texts)
-            logits_per_image = logit_scale * image_features @ text_features.t()
-            logits_per_text = logit_scale * text_features @ image_features.t()
+            logits_per_image, logits_per_text = model(dummy_imgs, dummy_texts)
             labels = torch.arange(batch_size, device=device)
             loss = (nn.functional.cross_entropy(logits_per_image, labels) +
                     nn.functional.cross_entropy(logits_per_text, labels)) / 2
@@ -323,8 +279,7 @@ def _try_batch_size(model, device, batch_size, img_resolution, context_length):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         peak_mem = torch.cuda.max_memory_allocated(device)
-        del dummy_imgs, dummy_texts, image_features, text_features, logit_scale
-        del logits_per_image, logits_per_text, labels, loss
+        del dummy_imgs, dummy_texts, logits_per_image, logits_per_text, labels, loss
         del optimizer
         torch.cuda.empty_cache()
         return True, peak_mem
@@ -518,12 +473,6 @@ def ddp_main(config, verbose=0):
 
     # Auto batch size: rank 0 searches, then broadcasts to all ranks
     if config.auto_batch_size:
-        # Compute target effective batch size BEFORE auto BS overwrites batch_size
-        if config.target_effective_batch_size > 0:
-            target_effective_bs = config.target_effective_batch_size
-        else:
-            target_effective_bs = config.batch_size * world_size * config.grad_accum_steps
-
         if rank == 0:
             found_bs = find_optimal_batch_size(config, rank=0)
         else:
@@ -531,24 +480,12 @@ def ddp_main(config, verbose=0):
         bs_tensor = torch.tensor(found_bs, dtype=torch.int64, device=f'cuda:{rank}')
         dist.broadcast(bs_tensor, src=0)
         config.batch_size = int(bs_tensor.item())
-
-        # Auto-compute gradient accumulation to maintain target effective batch size
-        config.grad_accum_steps = max(1, math.ceil(
-            target_effective_bs / (config.batch_size * world_size)
-        ))
-        actual_effective_bs = config.batch_size * world_size * config.grad_accum_steps
-
         if rank == 0:
             print(f"[AutoBS] All ranks using batch_size={config.batch_size}")
-            print(f"[AutoBS] grad_accum_steps={config.grad_accum_steps} "
-                  f"(target effective={target_effective_bs}, actual effective={actual_effective_bs})")
-            if config.grad_accum_steps > 1:
-                print(f"[AutoBS] Note: Gradient accumulation averages gradients over micro-batches, "
-                      f"but each micro-batch only has {config.batch_size} contrastive negatives per GPU.")
 
     try:
-        model, data_loader, device, optimizer, scheduler, scaler = make(config, rank)
-        train(model, data_loader, device, optimizer, scheduler, scaler, config, rank, world_size)
+        model, data_loader, device, criterion, optimizer, scheduler, scaler = make(config, rank)
+        train(model, data_loader, device, criterion, optimizer, scheduler, scaler, config, rank)
 
         # Save model only from rank 0
         if rank == 0:
@@ -586,29 +523,11 @@ def single_gpu_pipeline(config, verbose=0):
 
     # Auto batch size: find optimal before loading data
     if config.auto_batch_size:
-        # Compute target effective batch size BEFORE auto BS overwrites batch_size
-        if config.target_effective_batch_size > 0:
-            target_effective_bs = config.target_effective_batch_size
-        else:
-            target_effective_bs = config.batch_size * config.grad_accum_steps
-
         config.batch_size = find_optimal_batch_size(config)
-
-        # Auto-compute gradient accumulation to maintain target effective batch size
-        config.grad_accum_steps = max(1, math.ceil(
-            target_effective_bs / config.batch_size
-        ))
-        actual_effective_bs = config.batch_size * config.grad_accum_steps
-
         print(f"[AutoBS] Using batch_size={config.batch_size}")
-        print(f"[AutoBS] grad_accum_steps={config.grad_accum_steps} "
-              f"(target effective={target_effective_bs}, actual effective={actual_effective_bs})")
-        if config.grad_accum_steps > 1:
-            print(f"[AutoBS] Note: Gradient accumulation averages gradients over micro-batches, "
-                  f"but each micro-batch only has {config.batch_size} contrastive negatives.")
 
-    model, data_loader, device, optimizer, scheduler, scaler = make(config)
-    train(model, data_loader, device, optimizer, scheduler, scaler, config, rank=0, world_size=1)
+    model, data_loader, device, criterion, optimizer, scheduler, scaler = make(config)
+    train(model, data_loader, device, criterion, optimizer, scheduler, scaler, config)
 
     model_path = os.path.join(config.save_dir, str(config.model_name), 'checkpoint.pt')
     save(model, model_path)
@@ -680,14 +599,14 @@ def make(config, rank=0):
     else:
         print('Model on Device.')
 
+    criterion = nn.CrossEntropyLoss().cuda()
+
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.999)
     )
 
-    # total_steps = number of optimizer steps (not micro-batches)
-    # The scheduler steps once per optimizer step (every grad_accum_steps micro-batches)
-    total_steps = config.epochs * len(data_loader) // config.grad_accum_steps
+    total_steps = config.epochs * len(data_loader)
     if config.lr_schedule == 'cosine':
         def lr_lambda(current_step):
             if current_step < config.warmup_steps:
@@ -699,25 +618,16 @@ def make(config, rank=0):
         scheduler = None
 
     scaler = torch.amp.GradScaler("cuda")
-    return model, data_loader, device, optimizer, scheduler, scaler
+    return model, data_loader, device, criterion, optimizer, scheduler, scaler
 
-def train(model, loader, device, optimizer, scheduler, scaler, config, rank=0, world_size=1):
+def train(model, loader, device, criterion, optimizer, scheduler, scaler, config, rank=0):
     model.train()
-
-    # Log gathering info once
-    if rank == 0:
-        if world_size > 1:
-            print(f"[Gather] Cross-GPU feature gathering enabled: "
-                  f"{config.batch_size} per GPU x {world_size} GPUs = "
-                  f"{config.batch_size * world_size} negatives per micro-batch")
-        else:
-            print(f"[Gather] Single GPU: {config.batch_size} negatives per micro-batch")
-
+    
     # Only setup validation on rank 0 to avoid conflicts
     if rank == 0:
         val_loader, y_true_val, val_labels, val_templates, _ = setup_validation(config)
         validation_enabled = val_loader is not None
-
+        
         model_save_dir = os.path.join(config.save_dir, config.model_name)
         os.makedirs(model_save_dir, exist_ok=True)
         save_config(config, model_save_dir)
@@ -729,7 +639,7 @@ def train(model, loader, device, optimizer, scheduler, scaler, config, rank=0, w
         with open(val_log_path, 'w') as f:
             f.write(header_cols + "\n")
 
-        # Best model tracking variables
+        # Best model tracking variables 
         best_metric = float('-inf') if config.early_stopping_metric == 'mean_auc' else float('inf')
         epochs_without_improvement = 0
         best_epoch = 0
@@ -747,59 +657,36 @@ def train(model, loader, device, optimizer, scheduler, scaler, config, rank=0, w
         # Set epoch for distributed sampler to ensure proper data shuffling
         if hasattr(loader.sampler, 'set_epoch'):
             loader.sampler.set_epoch(epoch)
-
+            
         for data in tqdm(loader, disable=(rank != 0)):  # Only show progress bar on rank 0
             images = data['img'].to(device)
             # Get the actual model for text preprocessing (unwrap DDP if needed)
             model_for_text = model.module if hasattr(model, 'module') else model
             texts = preprocess_text(data['txt'], model_for_text).to(device)
 
-            # DDP: skip gradient AllReduce on non-final accumulation micro-batches
-            # NOTE: This skips DDP's gradient sync, NOT feature gathering.
-            # Feature gathering (all_gather) happens inside clip_contrastive_loss
-            # and runs on every micro-batch regardless.
-            is_accum_step = (batch_ct + 1) % config.grad_accum_steps != 0
-            maybe_no_sync = model.no_sync() if (is_accum_step and config.use_ddp) else nullcontext()
+            with torch.amp.autocast('cuda'):
+                logits_per_image, logits_per_text = model(images, texts)
+                labels = torch.arange(images.size(0), device=device)
+                loss_img = criterion(logits_per_image, labels)
+                loss_txt = criterion(logits_per_text, labels)
+                loss = (loss_img + loss_txt) / 2
 
-            with maybe_no_sync:
-                with torch.amp.autocast('cuda'):
-                    image_features, text_features, logit_scale = model(images, texts)
-                    loss = clip_contrastive_loss(
-                        image_features, text_features, logit_scale, world_size)
-                    # Scale loss so accumulated gradients average correctly
-                    if config.grad_accum_steps > 1:
-                        loss = loss / config.grad_accum_steps
+            scaler.scale(loss).backward()
 
-                scaler.scale(loss).backward()
-
-            if not is_accum_step:
-                # Gradient clipping (EVA-CLIP stability)
-                if config.grad_clip_norm > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), config.grad_clip_norm)
+            if (batch_ct + 1) % config.grad_accum_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 if scheduler: scheduler.step()
 
-                # Clamp logit_scale to ln(100) for stability (EVA-CLIP)
-                logit_scale_param = (model.module.logit_scale if hasattr(model, 'module')
-                                     else model.logit_scale)
-                with torch.no_grad():
-                    logit_scale_param.clamp_(0, math.log(100))
-
             example_ct += images.size(0)
             batch_ct += 1
-            # Track unscaled loss for logging (undo the 1/grad_accum_steps scaling)
-            running_loss += loss.item() * config.grad_accum_steps
+            running_loss += loss.item()
 
             # Only log and validate from rank 0
             if rank == 0:
                 if batch_ct % config.log_interval == 0:
-                    cur_logit_scale = logit_scale.item() if logit_scale.dim() == 0 else logit_scale[0].item()
-                    train_log(running_loss / config.log_interval, example_ct, epoch,
-                              logit_scale=cur_logit_scale)
+                    train_log(running_loss / config.log_interval, example_ct, epoch)
                     running_loss = 0.0
 
                 if config.do_validate and validation_enabled and (batch_ct % config.valid_interval) == 0:
@@ -835,7 +722,7 @@ def train(model, loader, device, optimizer, scheduler, scaler, config, rank=0, w
                         print(f"New best model saved! AUC: {tracking_auc:.4f} at step {batch_ct}")
                     else:
                         epochs_without_improvement += 1
-
+        
         # Early stopping check at the end of each epoch (DDP-safe)
         should_stop = False
         if config.early_stopping and rank == 0:
@@ -843,7 +730,7 @@ def train(model, loader, device, optimizer, scheduler, scaler, config, rank=0, w
                 print(f"Early stopping triggered! No improvement for {config.patience} validation intervals.")
                 print(f"Best mean AUC: {best_metric:.4f} achieved at step {best_step} (epoch {best_epoch})")
                 should_stop = True
-
+        
         # Synchronize early stopping decision across all processes
         if config.use_ddp:
             # Broadcast early stopping decision from rank 0 to all ranks
@@ -851,16 +738,15 @@ def train(model, loader, device, optimizer, scheduler, scaler, config, rank=0, w
             dist.broadcast(stop_tensor, src=0)
             should_stop = stop_tensor.item()
             dist.barrier()
-
+        
         if should_stop:
             break
-
+        
         # Reset running loss for next epoch
         running_loss = 0.0
 
-def train_log(loss, example_ct, epoch, logit_scale=None):
-    scale_str = f", logit_scale={logit_scale:.2f}" if logit_scale is not None else ""
-    print(f"Loss after {str(example_ct).zfill(5)} examples (Epoch {epoch}): {loss:.3f}{scale_str}")
+def train_log(loss, example_ct, epoch):
+    print(f"Loss after {str(example_ct).zfill(5)} examples (Epoch {epoch}): {loss:.3f}")
 
 def run_validation_step(model, val_loader, y_true_val, val_labels, val_templates, device, config):
     """Run zero-shot validation using the original ("{}", "no {}") template pair.
