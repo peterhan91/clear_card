@@ -232,7 +232,7 @@ def parse_args():
     parser.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha scaling factor (default: 32)')
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout rate (default: 0.05)')
     parser.add_argument('--lora_target_modules', type=str, nargs='+', default=None,
-                        help='Module names to apply LoRA to (default: auto-detect attention layers)')
+                        help='Module names to apply LoRA to (default: auto-detect attention + MLP layers)')
     # Early stopping arguments
     parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
     parser.add_argument('--patience', type=int, default=20, help='Number of epochs to wait without improvement before stopping')

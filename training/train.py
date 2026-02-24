@@ -197,9 +197,9 @@ def load_clip(model_path=None, pretrained=False, context_length=77,
                     detected = []
                     for name, module in dinov3_backbone.named_modules():
                         if isinstance(module, nn.Linear):
-                            # Target attention linear layers (qkv, proj, fc patterns)
+                            # Target attention + MLP linear layers (fc1/fc2 for standard MLP, w1/w2/w3 for SwiGLU)
                             short = name.split('.')[-1]
-                            if short in ('qkv', 'proj', 'fc1', 'fc2'):
+                            if short in ('qkv', 'proj', 'fc1', 'fc2', 'w1', 'w2', 'w3'):
                                 detected.append(name)
                     # Deduplicate while preserving order
                     seen = set()
