@@ -2,16 +2,19 @@
 
 # CXR Concept Embedding Generation Script (GH200 node)
 # Uses 3 LLM embedding models sequentially on a single GPU
-# Target: ~420k concepts -> embedding vectors
+# Target: ~492k cleaned concepts -> embedding vectors
 # Models: SFR-Embedding-Mistral (7B), llama-embed-nemotron-8b (8B), KaLM-Embedding-Gemma3-12B (12B)
+# Uses direct transformers inference (--embedding_type local) for GPU acceleration
 
 set -e  # Exit on any error
 
 # Configuration
-CSV_FILE="${1:-data/concepts.csv}"
-OUTPUT_DIR="${2:-embeddings_output}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CSV_FILE="${1:-$SCRIPT_DIR/concepts_clean.csv}"
+OUTPUT_DIR="${2:-$SCRIPT_DIR/embeddings_output}"
 BATCH_SIZE=32
 MAX_LENGTH=4096
+CONDA_ENV="ml311"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -20,6 +23,7 @@ echo "Starting CXR concept embedding generation on GH200..."
 echo "Input file: $CSV_FILE"
 echo "Output directory: $OUTPUT_DIR"
 echo "Batch size: $BATCH_SIZE, Max length: $MAX_LENGTH"
+echo "Conda env: $CONDA_ENV"
 echo ""
 
 # Function to run embedding generation
@@ -29,9 +33,9 @@ run_embedding() {
 
     echo "Starting $model_name ..."
 
-    python get_embed.py \
+    micromamba run -n "$CONDA_ENV" python "$SCRIPT_DIR/get_embed.py" \
         --concepts_file "$CSV_FILE" \
-        --embedding_type sentence_transformers \
+        --embedding_type local \
         --local_model "$model_name" \
         --preserve_indices \
         --output "$OUTPUT_DIR/cxr_embeddings_${output_suffix}.pickle" \

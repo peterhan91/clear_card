@@ -324,6 +324,10 @@ async def async_main(args):
     impressions_df = load_impressions(args.dataset, args.data_dir)
     print(f"Loaded {len(impressions_df)} impressions")
 
+    if args.limit is not None:
+        impressions_df = impressions_df.head(args.limit)
+        print(f"Limited to first {args.limit} impressions (debug mode)")
+
     if len(impressions_df) == 0:
         print("No impressions found. Check your data directory and CSV files.")
         return
@@ -427,6 +431,12 @@ def main():
         "--resume",
         action="store_true",
         help="Resume from existing checkpoint",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only the first N impressions (useful for debug runs)",
     )
     args = parser.parse_args()
 
