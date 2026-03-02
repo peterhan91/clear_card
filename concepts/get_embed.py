@@ -812,38 +812,45 @@ class RadiologyEmbeddingGenerator:
             logger.info(f"Using batch processing with batch size: {self.batch_size}")
             
             # Process in batches
-            for i in tqdm(range(0, len(concept_list), self.batch_size), desc="Processing batches"):
+            total_concepts = len(concept_list)
+            pbar = tqdm(total=total_concepts, desc="Embedding concepts", unit="concept",
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            for i in range(0, total_concepts, self.batch_size):
                 batch = concept_list[i:i + self.batch_size]
-                
+
                 try:
                     if self.embedding_type == "local":
                         batch_embeddings = self.get_local_embeddings_batch(batch)
                     else:  # sentence_transformers
                         batch_embeddings = self.get_sentence_transformer_embeddings_batch(batch)
-                    
+
                     # Assign embeddings to concepts
                     for concept, embedding in zip(batch, batch_embeddings):
                         if np.allclose(embedding, 0):
                             logger.warning(f"Failed to generate embedding for concept: \"{concept[:50]}...\" (received zero vector)")
                             failed_concepts_count += 1
                         embeddings[concept] = embedding
-                    
+
                 except Exception as e:
                     logger.error(f"Error processing batch starting at index {i}: {e}")
                     # Assign zero vectors for the entire batch
                     for concept in batch:
                         embeddings[concept] = np.zeros(self.embedding_dim)
                         failed_concepts_count += 1
-                
+
+                pbar.update(len(batch))
+                pbar.set_postfix(failed=failed_concepts_count)
+
                 # Fit PCA model if needed and we have enough samples
                 if self.apply_pca and self.pca_model is None and len(embeddings) >= 100:
                     valid_embeddings = [emb for emb in embeddings.values() if not np.allclose(emb, 0)]
                     if len(valid_embeddings) >= 50:  # Need sufficient samples for PCA
                         self._fit_pca_model(valid_embeddings[:1000])  # Use up to 1000 samples for fitting
-                
+
                 # Save intermediate results periodically
                 if save_intermediate and len(embeddings) % (self.batch_size * 10) == 0:
                     self._save_intermediate_results(embeddings, intermediate_file, is_partial_batch=True)
+            pbar.close()
         
         else:  # Azure OpenAI - process individually
             with tqdm(total=len(concept_list), desc="Processing concepts") as pbar:
@@ -929,35 +936,44 @@ class RadiologyEmbeddingGenerator:
             indexed_embeddings = {}
             
             # Process in batches
-            for i in tqdm(range(0, len(concept_texts), self.batch_size), desc="Processing batches"):
+            total_concepts = len(concept_texts)
+            failed_count = 0
+            pbar = tqdm(total=total_concepts, desc="Embedding concepts (indexed)", unit="concept",
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            for i in range(0, total_concepts, self.batch_size):
                 batch_texts = concept_texts[i:i + self.batch_size]
                 batch_indices = concept_indices[i:i + self.batch_size]
-                
+
                 try:
                     if self.embedding_type == "local":
                         batch_embeddings = self.get_local_embeddings_batch(batch_texts)
                     else:  # sentence_transformers
                         batch_embeddings = self.get_sentence_transformer_embeddings_batch(batch_texts)
-                    
+
                     # Map embeddings back to their indices
                     for idx, embedding in zip(batch_indices, batch_embeddings):
                         indexed_embeddings[idx] = embedding
-                    
+
                 except Exception as e:
                     logger.error(f"Error processing batch starting at index {i}: {e}")
                     # Assign zero vectors for the entire batch
                     for idx in batch_indices:
                         indexed_embeddings[idx] = np.zeros(self.embedding_dim)
-                
+                    failed_count += len(batch_indices)
+
+                pbar.update(len(batch_texts))
+                pbar.set_postfix(failed=failed_count)
+
                 # Fit PCA model if needed and we have enough samples
                 if self.apply_pca and self.pca_model is None and len(indexed_embeddings) >= 100:
                     valid_embeddings = [emb for emb in indexed_embeddings.values() if not np.allclose(emb, 0)]
                     if len(valid_embeddings) >= 50:  # Need sufficient samples for PCA
                         self._fit_pca_model(valid_embeddings[:1000])  # Use up to 1000 samples for fitting
-                
+
                 # Save intermediate results periodically
                 if save_intermediate and len(indexed_embeddings) % (self.batch_size * 10) == 0:
                     self._save_intermediate_indexed_results(indexed_embeddings, intermediate_file)
+            pbar.close()
         
         else:  # Azure OpenAI - process individually
             indexed_embeddings = {}
