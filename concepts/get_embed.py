@@ -572,8 +572,16 @@ class RadiologyEmbeddingGenerator:
             # Generate embeddings
             with torch.no_grad():
                 outputs = self.model(**inputs)
-                embeddings = last_token_pool(outputs.last_hidden_state, inputs['attention_mask'])
-                
+
+                # Use appropriate pooling method
+                pooling = getattr(self, 'pooling_method', 'last_token')
+                if pooling == "cls_token":
+                    embeddings = cls_token_pool(outputs.last_hidden_state, inputs['attention_mask'])
+                elif pooling == "average":
+                    embeddings = average_pool(outputs.last_hidden_state, inputs['attention_mask'])
+                else:
+                    embeddings = last_token_pool(outputs.last_hidden_state, inputs['attention_mask'])
+
                 # Normalize embeddings
                 embeddings = F.normalize(embeddings, p=2, dim=1)
                 

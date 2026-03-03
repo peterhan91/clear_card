@@ -33,6 +33,13 @@ run_embedding() {
 
     echo "Starting $model_name ..."
 
+    local resume_file="$OUTPUT_DIR/intermediate_${output_suffix}_indexed.pickle"
+    local resume_flag=""
+    if [ -f "$resume_file" ]; then
+        echo "  Resuming from $resume_file"
+        resume_flag="--resume $resume_file"
+    fi
+
     micromamba run -n "$CONDA_ENV" python "$SCRIPT_DIR/get_embed.py" \
         --concepts_file "$CSV_FILE" \
         --embedding_type local \
@@ -45,7 +52,8 @@ run_embedding() {
         --use_fp16 \
         --trust_remote_code \
         --validate \
-        --intermediate_file_path "$OUTPUT_DIR/intermediate_${output_suffix}.pickle"
+        --intermediate_file_path "$OUTPUT_DIR/intermediate_${output_suffix}.pickle" \
+        $resume_flag
 
     echo "Completed $model_name"
     echo ""
