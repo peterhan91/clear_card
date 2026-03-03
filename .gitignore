@@ -48,6 +48,7 @@ data/h5/
 concepts/embeddings_output/
 concepts/concepts_*.json
 concepts/concepts_*.csv
+!concepts/concepts_clean.csv
 
 # Training checkpoints
 checkpoints/
