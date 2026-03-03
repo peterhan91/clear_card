@@ -20,6 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Environment / secrets
+.env
+
 # Virtual environments
 venv/
 ENV/
@@ -40,7 +43,11 @@ env/
 # Data files (large)
 *.h5
 *.hdf5
+*.pickle
 data/h5/
+concepts/embeddings_output/
+concepts/concepts_*.json
+concepts/concepts_*.csv
 
 # Training checkpoints
 checkpoints/
