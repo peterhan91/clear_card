@@ -250,23 +250,34 @@ class RadiologyEmbeddingGenerator:
             tokenizer_kwargs = self.model_config.get("tokenizer_kwargs", {}).copy()
             
             if model_kwargs.get("torch_dtype") == "auto":
-                if self.use_fp16 and self.device.type == "cuda" and any(x in model_name.lower() for x in ["8b", "7b"]):
-                    model_kwargs["torch_dtype"] = torch.float16
-                    logger.info("FP16 enabled for large model")
+                if self.use_fp16 and self.device.type == "cuda":
+                    # Use BF16 for models that don't support FP16 well (e.g. Gemma3)
+                    if any(x in model_name.lower() for x in ["gemma"]):
+                        model_kwargs["torch_dtype"] = torch.bfloat16
+                        logger.info("BF16 enabled for Gemma model")
+                    elif any(x in model_name.lower() for x in ["8b", "7b", "12b", "13b"]):
+                        model_kwargs["torch_dtype"] = torch.float16
+                        logger.info("FP16 enabled for large model")
+                    else:
+                        model_kwargs.pop("torch_dtype", None)
                 else:
                     model_kwargs.pop("torch_dtype", None)
             
             if "device_map" not in model_kwargs:
                 model_kwargs["device"] = self.device
             
+            # Avoid duplicate trust_remote_code if already in kwargs
+            if "trust_remote_code" not in tokenizer_kwargs:
+                tokenizer_kwargs["trust_remote_code"] = self.trust_remote_code
+            if "trust_remote_code" not in model_kwargs:
+                model_kwargs["trust_remote_code"] = self.trust_remote_code
+
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, 
-                trust_remote_code=self.trust_remote_code,
+                model_name,
                 **tokenizer_kwargs
             )
             self.model = AutoModel.from_pretrained(
-                model_name, 
-                trust_remote_code=self.trust_remote_code,
+                model_name,
                 **model_kwargs
             )
             
@@ -645,20 +656,20 @@ class RadiologyEmbeddingGenerator:
         """Generate embedding using direct transformers approach."""
         # Tokenize
         inputs = self.tokenizer(
-            text, 
-            max_length=self.max_length, 
-            padding=True, 
-            truncation=True, 
+            text,
+            max_length=self.max_length,
+            padding=True,
+            truncation=True,
             return_tensors='pt'
         )
-        
+
         # Move to device
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        
+
         # Generate embedding
         with torch.no_grad():
             outputs = self.model(**inputs)
-            
+
             # Use appropriate pooling method
             if self.pooling_method == "cls_token":
                 embedding = cls_token_pool(outputs.last_hidden_state, inputs['attention_mask'])
@@ -669,11 +680,11 @@ class RadiologyEmbeddingGenerator:
 
             # Normalize embedding (average_pool already normalizes)
             if self.pooling_method != "average":
-                embedding = F.normalize(embedding, p=2, dim=1)
-            
-            # Convert to numpy
-            embedding_np = embedding.cpu().numpy().flatten()
-        
+                embedding = F.normalize(embedding.float(), p=2, dim=1)
+
+            # Convert to float32 then numpy (handles bf16)
+            embedding_np = embedding.float().cpu().numpy().flatten()
+
         return embedding_np
     
     def get_sentence_transformer_embeddings_batch(self, texts: List[str]) -> List[np.ndarray]:
@@ -745,20 +756,20 @@ class RadiologyEmbeddingGenerator:
         """Generate embeddings using direct transformers batch approach."""
         # Tokenize batch
         inputs = self.tokenizer(
-            formatted_texts, 
-            max_length=self.max_length, 
-            padding=True, 
-            truncation=True, 
+            formatted_texts,
+            max_length=self.max_length,
+            padding=True,
+            truncation=True,
             return_tensors='pt'
         )
-        
+
         # Move to device
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        
+
         # Generate embeddings
         with torch.no_grad():
             outputs = self.model(**inputs)
-            
+
             # Use appropriate pooling method
             if self.pooling_method == "cls_token":
                 embeddings = cls_token_pool(outputs.last_hidden_state, inputs['attention_mask'])
@@ -769,10 +780,10 @@ class RadiologyEmbeddingGenerator:
 
             # Normalize embeddings (average_pool already normalizes)
             if self.pooling_method != "average":
-                embeddings = F.normalize(embeddings, p=2, dim=1)
-            
-            # Convert to numpy
-            embeddings_np = embeddings.cpu().numpy()
+                embeddings = F.normalize(embeddings.float(), p=2, dim=1)
+
+            # Convert to float32 then numpy (handles bf16)
+            embeddings_np = embeddings.float().cpu().numpy()
         
         # Handle empty texts
         result = []

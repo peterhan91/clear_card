@@ -110,7 +110,7 @@ def load_clip(model_path, pretrained=False, context_length=77,
                     for name, module in dinov3_backbone.named_modules():
                         if isinstance(module, nn.Linear):
                             short = name.split('.')[-1]
-                            if short in ('qkv', 'proj', 'fc1', 'fc2'):
+                            if short in ('qkv', 'proj', 'fc1', 'fc2', 'w1', 'w2', 'w3'):
                                 detected.append(name)
                     seen = set()
                     lora_target_modules = []
