@@ -29,6 +29,7 @@ import datetime
 import argparse
 import gc
 import random
+import hashlib
 from typing import List, Optional
 
 import numpy as np
@@ -119,6 +120,12 @@ WEIGHT_DECAY = 1e-8
 MAX_EPOCHS = 200
 PATIENCE = 10
 TRAIN_BATCH_SIZE = 512
+
+
+def get_cache_tag(model_path: str) -> str:
+    """Derive a short hash from the checkpoint directory for cache invalidation."""
+    ckpt_dir = os.path.basename(os.path.dirname(os.path.abspath(model_path)))
+    return hashlib.md5(ckpt_dir.encode()).hexdigest()[:8]
 
 
 def print_gpu_memory(stage=""):
@@ -308,7 +315,9 @@ def load_concepts(max_concepts: int = 0):
     return concepts, indices
 
 
-def load_concept_embeddings(model_key: str, concept_indices: List[int]):
+def load_concept_embeddings(model_key: str, concept_indices: List[int],
+                            concept_texts: List[str] = None):
+    """Load precomputed concept embeddings. Supports both int-keyed and string-keyed pickles."""
     info = EMBEDDING_MODELS[model_key]
     pickle_path = os.path.join(EMBEDDINGS_DIR,
                                f"cxr_embeddings_{info['pickle_suffix']}.pickle")
@@ -317,12 +326,29 @@ def load_concept_embeddings(model_key: str, concept_indices: List[int]):
     with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
 
+    first_key = next(iter(data))
+    uses_string_keys = isinstance(first_key, str)
+    if uses_string_keys:
+        print(f"  Detected string-keyed pickle (e.g., {repr(first_key)[:60]})")
+        data_lower = {k.lower(): v for k, v in data.items()}
+    else:
+        print(f"  Detected integer-keyed pickle (e.g., {first_key})")
+        data_lower = None
+
     dim = info['dim']
     embeddings = np.zeros((len(concept_indices), dim), dtype=np.float32)
     missing = 0
     for pos, idx in enumerate(concept_indices):
-        if idx in data:
-            emb = data[idx]
+        emb = None
+        if not uses_string_keys:
+            emb = data.get(idx)
+        elif concept_texts is not None:
+            text = concept_texts[pos]
+            emb = data.get(text)
+            if emb is None:
+                emb = data_lower.get(text.lower())
+
+        if emb is not None:
             if isinstance(emb, np.ndarray):
                 embeddings[pos] = emb.astype(np.float32)
             else:
@@ -608,8 +634,9 @@ def run_linear_probing_pipeline(args):
     image_features = {}
 
     for split_name, (split_df, _) in splits_data.items():
+        tag = get_cache_tag(args.model_path)
         cache_path = os.path.join(feature_cache_dir,
-                                  f"mimic_{split_name}_image_features.pt")
+                                  f"mimic_{split_name}_{tag}.pt")
         if os.path.exists(cache_path) and not args.no_cache:
             print(f"  Loading cached {split_name} features from {cache_path}")
             image_features[split_name] = torch.load(cache_path,
@@ -645,7 +672,7 @@ def run_linear_probing_pipeline(args):
         print(f"{'=' * 70}")
 
         # Load precomputed concept embeddings
-        concept_embeds = load_concept_embeddings(model_key, concept_indices)
+        concept_embeds = load_concept_embeddings(model_key, concept_indices, concepts)
 
         # Project all splits to LLM space
         split_repr = {}
@@ -852,7 +879,7 @@ def parse_args():
                         help='Max concepts to use (0 = all ~492k)')
     parser.add_argument('--n_seeds', type=int, default=5,
                         help='Number of random seeds (default 5)')
-    parser.add_argument('--image_batch_size', type=int, default=16,
+    parser.add_argument('--image_batch_size', type=int, default=64,
                         help='Batch size for image encoding')
     parser.add_argument('--concept_batch_size', type=int, default=512,
                         help='Batch size for concept text encoding')

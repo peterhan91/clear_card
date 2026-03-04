@@ -1,0 +1,4 @@
+,heart_failure_auc,hfref_auc,hfpef_auc,atrial_fibrillation_auc,mitral_valve_auc,aortic_valve_auc,tricuspid_valve_auc,cad_auc,myocardial_infarction_auc,pulmonary_htn_auc,stroke_auc,copd_auc,asthma_auc,ild_auc,lung_cancer_auc,tuberculosis_auc,t2dm_auc,obesity_auc,dyslipidemia_auc,osteoporosis_auc,spinal_stenosis_auc,hypertension_auc,ckd_auc,pvd_auc,liver_cirrhosis_auc,anemia_auc
+mean,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5
+lower,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5
+upper,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5

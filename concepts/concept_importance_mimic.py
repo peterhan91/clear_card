@@ -81,8 +81,9 @@ def load_concepts():
     return concepts, indices
 
 
-def load_concept_embeddings(model_key: str, concept_indices: List[int]):
-    """Load precomputed LLM embeddings for concepts."""
+def load_concept_embeddings(model_key: str, concept_indices: List[int],
+                            concept_texts: List[str] = None):
+    """Load precomputed LLM embeddings. Supports both int-keyed and string-keyed pickles."""
     info = EMBEDDING_MODELS[model_key]
     pickle_path = os.path.join(EMBEDDINGS_DIR,
                                f"cxr_embeddings_{info['pickle_suffix']}.pickle")
@@ -91,12 +92,29 @@ def load_concept_embeddings(model_key: str, concept_indices: List[int]):
     with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
 
+    first_key = next(iter(data))
+    uses_string_keys = isinstance(first_key, str)
+    if uses_string_keys:
+        print(f"  Detected string-keyed pickle (e.g., {repr(first_key)[:60]})")
+        data_lower = {k.lower(): v for k, v in data.items()}
+    else:
+        print(f"  Detected integer-keyed pickle (e.g., {first_key})")
+        data_lower = None
+
     dim = info['dim']
     embeddings = np.zeros((len(concept_indices), dim), dtype=np.float32)
     missing = 0
     for pos, idx in enumerate(concept_indices):
-        if idx in data:
-            emb = data[idx]
+        emb = None
+        if not uses_string_keys:
+            emb = data.get(idx)
+        elif concept_texts is not None:
+            text = concept_texts[pos]
+            emb = data.get(text)
+            if emb is None:
+                emb = data_lower.get(text.lower())
+
+        if emb is not None:
             if isinstance(emb, np.ndarray):
                 embeddings[pos] = emb.astype(np.float32)
             else:
@@ -378,7 +396,7 @@ def run_importance_analysis(args):
     # Load concepts and embeddings
     print()
     concepts, concept_indices = load_concepts()
-    concept_embeddings = load_concept_embeddings(model_key, concept_indices)
+    concept_embeddings = load_concept_embeddings(model_key, concept_indices, concepts)
 
     # Verify dimensions match
     assert weight_matrix.shape[1] == concept_embeddings.shape[1], (

@@ -189,8 +189,11 @@ def load_concepts(max_concepts: int = 0):
     return concepts, indices
 
 
-def load_concept_embeddings(model_key: str, concept_indices: List[int]):
-    """Load precomputed concept embeddings from pickle and align to concept order."""
+def load_concept_embeddings(model_key: str, concept_indices: List[int],
+                            concept_texts: List[str] = None):
+    """Load precomputed concept embeddings from pickle and align to concept order.
+    Supports both integer-keyed (concept_idx) and string-keyed (concept text) pickles.
+    """
     info = EMBEDDING_MODELS[model_key]
     pickle_path = os.path.join(EMBEDDINGS_DIR,
                                f"cxr_embeddings_{info['pickle_suffix']}.pickle")
@@ -199,12 +202,32 @@ def load_concept_embeddings(model_key: str, concept_indices: List[int]):
     with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
 
+    # Detect key type from first key
+    first_key = next(iter(data))
+    uses_string_keys = isinstance(first_key, str)
+    if uses_string_keys:
+        print(f"  Detected string-keyed pickle (e.g., {repr(first_key)[:60]})")
+        # Build lowercase lookup for case-insensitive matching
+        data_lower = {k.lower(): v for k, v in data.items()}
+        print(f"  Built case-insensitive lookup ({len(data_lower)} keys)")
+    else:
+        print(f"  Detected integer-keyed pickle (e.g., {first_key})")
+        data_lower = None
+
     dim = info['dim']
     embeddings = np.zeros((len(concept_indices), dim), dtype=np.float32)
     missing = 0
     for pos, idx in enumerate(concept_indices):
-        if idx in data:
-            emb = data[idx]
+        emb = None
+        if not uses_string_keys:
+            emb = data.get(idx)
+        elif concept_texts is not None:
+            text = concept_texts[pos]
+            emb = data.get(text)
+            if emb is None:
+                emb = data_lower.get(text.lower())
+
+        if emb is not None:
             if isinstance(emb, np.ndarray):
                 embeddings[pos] = emb.astype(np.float32)
             else:
@@ -514,7 +537,7 @@ def run_zeroshot_pipeline(args):
         print(f"{'='*70}")
 
         # Load precomputed concept embeddings
-        concept_embeds = load_concept_embeddings(model_key, concept_indices)
+        concept_embeds = load_concept_embeddings(model_key, concept_indices, concepts)
 
         # Project images to LLM space
         print("  Projecting images to LLM embedding space...")

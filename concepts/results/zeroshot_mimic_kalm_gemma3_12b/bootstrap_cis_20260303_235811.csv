@@ -1,0 +1,4 @@
+,heart_failure_auc,hfref_auc,hfpef_auc,atrial_fibrillation_auc,mitral_valve_auc,aortic_valve_auc,tricuspid_valve_auc,cad_auc,myocardial_infarction_auc,pulmonary_htn_auc,stroke_auc,copd_auc,asthma_auc,ild_auc,lung_cancer_auc,tuberculosis_auc,t2dm_auc,obesity_auc,dyslipidemia_auc,osteoporosis_auc,spinal_stenosis_auc,hypertension_auc,ckd_auc,pvd_auc,liver_cirrhosis_auc,anemia_auc
+mean,0.74,0.712,0.6419,0.7007,0.7044,0.7516,0.8361,0.6764,0.7258,0.7094,0.6757,0.6305,0.4344,0.7438,0.6476,0.698,0.5405,0.5917,0.5492,0.5905,0.5802,0.6061,0.6268,0.6491,0.5922,0.6543
+lower,0.7239,0.6929,0.618,0.6838,0.669,0.7069,0.8103,0.6595,0.7061,0.6838,0.6165,0.6064,0.3917,0.7111,0.6182,0.6075,0.5175,0.5613,0.5285,0.55,0.4846,0.5882,0.6059,0.6138,0.5236,0.6275
+upper,0.756,0.7304,0.6677,0.7179,0.7384,0.7948,0.8629,0.6925,0.7453,0.7329,0.7318,0.6528,0.4777,0.7788,0.6771,0.7861,0.5614,0.623,0.5689,0.6282,0.6677,0.623,0.6464,0.6814,0.6546,0.6822

@@ -29,6 +29,7 @@ import pickle
 import datetime
 import argparse
 import gc
+import hashlib
 from typing import List
 
 import numpy as np
@@ -148,6 +149,12 @@ EMBEDDING_MODELS = {
         'prompt_mode': 'openai_api',
     },
 }
+
+
+def get_cache_tag(model_path: str) -> str:
+    """Derive a short hash from the checkpoint directory for cache invalidation."""
+    ckpt_dir = os.path.basename(os.path.dirname(os.path.abspath(model_path)))
+    return hashlib.md5(ckpt_dir.encode()).hexdigest()[:8]
 
 
 def load_env():
@@ -325,8 +332,11 @@ def load_concepts(max_concepts: int = 0):
     return concepts, indices
 
 
-def load_concept_embeddings(model_key: str, concept_indices: List[int]):
-    """Load precomputed concept embeddings from pickle and align to concept order."""
+def load_concept_embeddings(model_key: str, concept_indices: List[int],
+                            concept_texts: List[str] = None):
+    """Load precomputed concept embeddings from pickle and align to concept order.
+    Supports both integer-keyed (concept_idx) and string-keyed (concept text) pickles.
+    """
     info = EMBEDDING_MODELS[model_key]
     pickle_path = os.path.join(EMBEDDINGS_DIR,
                                f"cxr_embeddings_{info['pickle_suffix']}.pickle")
@@ -335,12 +345,30 @@ def load_concept_embeddings(model_key: str, concept_indices: List[int]):
     with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
 
+    # Detect key type from first key
+    first_key = next(iter(data))
+    uses_string_keys = isinstance(first_key, str)
+    if uses_string_keys:
+        print(f"  Detected string-keyed pickle (e.g., {repr(first_key)[:60]})")
+        data_lower = {k.lower(): v for k, v in data.items()}
+    else:
+        print(f"  Detected integer-keyed pickle (e.g., {first_key})")
+        data_lower = None
+
     dim = info['dim']
     embeddings = np.zeros((len(concept_indices), dim), dtype=np.float32)
     missing = 0
     for pos, idx in enumerate(concept_indices):
-        if idx in data:
-            emb = data[idx]
+        emb = None
+        if not uses_string_keys:
+            emb = data.get(idx)
+        elif concept_texts is not None:
+            text = concept_texts[pos]
+            emb = data.get(text)
+            if emb is None:
+                emb = data_lower.get(text.lower())
+
+        if emb is not None:
             if isinstance(emb, np.ndarray):
                 embeddings[pos] = emb.astype(np.float32)
             else:
@@ -692,7 +720,20 @@ def run_zeroshot_pipeline(args):
     print("\n[Step 4/6] Encoding concepts and images through CLIP...")
     concept_features = encode_concepts(model, concepts,
                                        batch_size=args.concept_batch_size)
-    image_features = encode_images(model, loader)
+
+    # Cache-aware image encoding (test split only)
+    cache_dir = os.path.join(os.path.dirname(__file__), 'cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = get_cache_tag(args.model_path)
+    cache_path = os.path.join(cache_dir, f"mimic_test_{tag}.pt")
+
+    if os.path.exists(cache_path) and not args.no_cache:
+        print(f"  Loading cached test features from {cache_path}")
+        image_features = torch.load(cache_path, weights_only=True)
+    else:
+        image_features = encode_images(model, loader)
+        torch.save(image_features, cache_path)
+        print(f"  Cached test features to {cache_path}")
 
     # Compute concept similarity scores (reused across embedding models)
     print("\n  Computing concept similarity scores...")
@@ -717,7 +758,7 @@ def run_zeroshot_pipeline(args):
         print(f"{'='*70}")
 
         # Load precomputed concept embeddings
-        concept_embeds = load_concept_embeddings(model_key, concept_indices)
+        concept_embeds = load_concept_embeddings(model_key, concept_indices, concepts)
 
         # Project images to LLM space
         print("  Projecting images to LLM embedding space...")
@@ -789,7 +830,9 @@ def parse_args():
                         help='Embedding models to evaluate')
     parser.add_argument('--max_concepts', type=int, default=0,
                         help='Max concepts to use (0 = all ~492k)')
-    parser.add_argument('--image_batch_size', type=int, default=16,
+    parser.add_argument('--no_cache', action='store_true', default=False,
+                        help='Disable image feature caching')
+    parser.add_argument('--image_batch_size', type=int, default=64,
                         help='Batch size for image encoding')
     parser.add_argument('--concept_batch_size', type=int, default=512,
                         help='Batch size for concept text encoding')

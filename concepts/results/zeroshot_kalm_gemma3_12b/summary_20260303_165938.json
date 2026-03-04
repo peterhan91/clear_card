@@ -1,0 +1,56 @@
+{
+  "timestamp": "20260303_165938",
+  "method": "concept_zeroshot_vit7b_lora",
+  "embedding_model": "kalm_gemma3_12b",
+  "n_concepts": 492021,
+  "n_test_images": 500,
+  "n_labels": 14,
+  "labels": [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "Enlarged Cardiomediastinum",
+    "Fracture",
+    "Lung Lesion",
+    "Lung Opacity",
+    "No Finding",
+    "Pleural Effusion",
+    "Pleural Other",
+    "Pneumonia",
+    "Pneumothorax",
+    "Support Devices"
+  ],
+  "mean_core_auc": 0.8023304489556844,
+  "mean_all_auc": 0.6730289277606658,
+  "per_label_aucs": {
+    "Atelectasis": 0.8094969015464015,
+    "Cardiomegaly": 0.7412474620011764,
+    "Consolidation": 0.7808770773848746,
+    "Edema": 0.8176570664722324,
+    "Enlarged Cardiomediastinum": 0.7856811380838842,
+    "Fracture": 0.4698989898989899,
+    "Lung Lesion": 0.6440548780487805,
+    "Lung Opacity": 0.283834103749358,
+    "No Finding": 0.4372698482839888,
+    "Pleural Effusion": 0.8623737373737373,
+    "Pleural Other": 0.38961693548387094,
+    "Pneumonia": 0.7836029001673174,
+    "Pneumothorax": 0.7621633853813079,
+    "Support Devices": 0.8546305647734015
+  },
+  "model_path": "/cbica/projects/CXR/codes/clear_card/checkpoints/dinov3-vit7b16-lora-r32-a64-combined_vit7b16_20260224_144733/best_model.pt",
+  "normalization": {
+    "mean": [
+      101.48761,
+      101.48761,
+      101.48761
+    ],
+    "std": [
+      83.43944,
+      83.43944,
+      83.43944
+    ]
+  },
+  "resolution": 448
+}
