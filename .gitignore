@@ -45,6 +45,7 @@ env/
 *.hdf5
 *.pickle
 data/h5/
+preprocessing/PADCHEST_chest_x_ray_images_labels_160K_01.02.19*.csv
 concepts/embeddings_output/
 concepts/concepts_*.json
 concepts/concepts_*.csv
