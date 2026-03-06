@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Preprocess MIMIC-CXR JPEGs into per-split H5 files for the opportunistic
+Preprocess MIMIC-CXR JPEGs into per-split H5 files for the PheWAS
 phenotype experiments.
 
-Reads mimic_opportunistic_labels.csv (which has a 'split' column with
-train/validate/test), resolves JPEG paths, and converts each split into
-an H5 file via img_to_hdf5_parallel (same pipeline as CheXpert-Plus and
-ReXGradient preprocessing).
+Reads mimic_phewas_labels.parquet (which has a 'split' column with
+train/validate/test from a custom patient-level 40/10/50 split),
+resolves JPEG paths, and converts each split into an H5 file via
+img_to_hdf5_parallel.
 
 Usage:
   python preprocess_mimic.py \
-      --labels_csv ../data/mimic_opportunistic_labels.csv \
+      --labels ../data/mimic_phewas_labels.parquet \
       --mimic_jpg_dir /cbica/projects/CXR/data/MIMIC-CXR/data/images/mimic-cxr-jpg-2.1.0/mimic-cxr-jpg-2.1.0.physionet.org \
       --output_dir /cbica/projects/CXR/data_p \
       --resolution 448 \
@@ -38,8 +38,15 @@ def build_jpeg_path(row, mimic_jpg_dir: str) -> str:
     )
 
 
+def load_labels(path: str) -> pd.DataFrame:
+    """Load labels from parquet or CSV."""
+    if path.endswith('.parquet'):
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
 def preprocess_mimic(
-    labels_csv: str,
+    labels_path: str,
     mimic_jpg_dir: str,
     output_dir: str,
     resolution: int = 448,
@@ -47,8 +54,8 @@ def preprocess_mimic(
 ):
     os.makedirs(output_dir, exist_ok=True)
 
-    df = pd.read_csv(labels_csv)
-    print(f"Loaded {len(df)} rows from {labels_csv}")
+    df = load_labels(labels_path)
+    print(f"Loaded {len(df)} rows from {labels_path}")
     print(f"Splits: {df['split'].value_counts().to_dict()}")
 
     split_map = {
@@ -83,7 +90,8 @@ def preprocess_mimic(
         )
 
         # Save metadata with h5_index
-        meta = df_split.copy()
+        meta = df_split[['dicom_id', 'subject_id', 'study_id', 'split',
+                          'ViewPosition', 'icd_source']].copy()
         meta['h5_index'] = meta.index
         meta_path = os.path.join(output_dir, h5_name.replace('.h5', '_metadata.csv'))
         meta.to_csv(meta_path, index=False)
@@ -98,7 +106,8 @@ def preprocess_mimic(
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Preprocess MIMIC-CXR JPEGs into per-split H5 files")
-    parser.add_argument('--labels_csv', type=str, required=True)
+    parser.add_argument('--labels', type=str, required=True,
+                        help='Path to labels parquet or CSV')
     parser.add_argument('--mimic_jpg_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--resolution', type=int, default=448)
@@ -109,7 +118,7 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
     preprocess_mimic(
-        labels_csv=args.labels_csv,
+        labels_path=args.labels,
         mimic_jpg_dir=args.mimic_jpg_dir,
         output_dir=args.output_dir,
         resolution=args.resolution,

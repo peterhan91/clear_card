@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Foundation Model Linear Probing on MIMIC-CXR
-27 Opportunistic Screening Phenotypes
+1,327 PheWAS Phenotypes (following Merlin's full phenotype evaluation)
 
 Extracts image features from pretrained foundation models and trains
 linear probes.  No concept-based projection -- features are used directly.
@@ -46,25 +46,15 @@ from sklearn.metrics import roc_auc_score
 # ---------------------------------------------------------------------------
 # Constants  (shared with exp_linear_mimic.py)
 # ---------------------------------------------------------------------------
-PHENOTYPE_LABELS = [
-    'heart_failure', 'hfref', 'hfpef', 'atrial_fibrillation',
-    'mitral_valve', 'aortic_valve', 'tricuspid_valve', 'pulmonary_valve',
-    'cad', 'myocardial_infarction', 'pulmonary_htn', 'stroke',
-    'copd', 'asthma', 'ild', 'lung_cancer', 'tuberculosis',
-    't2dm', 'obesity', 'dyslipidemia',
-    'osteoporosis', 'spinal_stenosis',
-    'hypertension', 'ckd', 'pvd', 'liver_cirrhosis', 'anemia',
-]
+# Metadata columns in the labels parquet (not phenotype labels)
+META_COLUMNS = {'dicom_id', 'subject_id', 'study_id', 'split',
+                'ViewPosition', 'icd_source'}
 
-SKIP_EVAL_LABELS = {'pulmonary_valve'}
+# Min test positives required to evaluate a phenotype
+MIN_TEST_POSITIVES = 20
 
-CORE_PHENOTYPES = [
-    'heart_failure', 'hfref', 'hfpef', 'atrial_fibrillation',
-    'cad', 'pulmonary_htn', 'copd', 'lung_cancer',
-]
-
-DEFAULT_LABELS_CSV = os.path.join(
-    os.path.dirname(__file__), '..', 'data', 'mimic_opportunistic_labels.csv')
+DEFAULT_LABELS = os.path.join(
+    os.path.dirname(__file__), '..', 'data', 'mimic_phewas_labels.parquet')
 DEFAULT_MIMIC_JPG_DIR = "/cbica/projects/CXR/data_p/mimic-cxr-jpg/"
 
 # Training hyper-parameters (identical to concept-based linear probing)
@@ -378,18 +368,43 @@ def encode_images(model_name, model, loader, device):
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_all_splits(labels_csv):
-    full_df = pd.read_csv(labels_csv)
-    label_cols = [c for c in PHENOTYPE_LABELS if c in full_df.columns]
+def load_all_splits(labels_path):
+    """Load labels for all splits from parquet or CSV.
+
+    Auto-detects phecode columns (all columns not in META_COLUMNS).
+    Returns: dict of {split_name: (df, y_labels, label_cols)}
+    """
+    if labels_path.endswith('.parquet'):
+        full_df = pd.read_parquet(labels_path)
+    else:
+        full_df = pd.read_csv(labels_path)
+
+    # Auto-detect phenotype columns
+    label_cols = [c for c in full_df.columns if c not in META_COLUMNS]
+    print(f"  Detected {len(label_cols)} phenotype columns")
+
+    # Safety checks
+    assert full_df['dicom_id'].duplicated().sum() == 0, "Duplicate dicom_ids in labels"
+    label_vals = full_df[label_cols].values
+    assert label_vals.min() >= 0 and label_vals.max() <= 1, "Non-binary label values"
+    assert not np.any(np.isnan(label_vals)), "NaN values in labels"
 
     splits = {}
     for split in ['train', 'validate', 'test']:
         df = full_df[full_df['split'] == split].reset_index(drop=True)
-        y = df[label_cols].values.astype(float)
-        y = np.nan_to_num(y, nan=0.0)
-        y[y < 0] = 0.0
+        y = df[label_cols].values.astype(np.float32)
         splits[split] = (df, y, label_cols)
-        print(f"  {split}: {len(df)} images, {len(label_cols)} labels")
+        n_pos_cols = (y.sum(axis=0) > 0).sum()
+        print(f"  {split}: {len(df)} images, {len(label_cols)} labels "
+              f"({n_pos_cols} with >0 positives)")
+
+    # Verify no patient overlap
+    for s1, s2 in [('train', 'test'), ('train', 'validate'), ('validate', 'test')]:
+        p1 = set(splits[s1][0]['subject_id'])
+        p2 = set(splits[s2][0]['subject_id'])
+        assert len(p1 & p2) == 0, f"Patient overlap between {s1} and {s2}"
+    print("  No patient overlap between splits")
+
     return splits
 
 
@@ -429,14 +444,11 @@ def evaluate_model(model, loader, device):
     return np.concatenate(all_t), np.concatenate(all_p)
 
 
-def compute_aucs(y_true, y_pred, labels, skip_labels=None):
-    skip_labels = skip_labels or set()
+def compute_aucs(y_true, y_pred, labels, min_positives=MIN_TEST_POSITIVES):
     aucs = {}
     for i, label in enumerate(labels):
-        if label in skip_labels:
-            continue
         n_pos = int(y_true[:, i].sum())
-        if n_pos == 0 or n_pos == len(y_true):
+        if n_pos < min_positives or n_pos == len(y_true):
             continue
         aucs[label] = roc_auc_score(y_true[:, i], y_pred[:, i])
     return aucs
@@ -476,7 +488,7 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
 
         y_t_val, y_p_val = evaluate_model(lr_model, val_loader, device)
         val_aucs = compute_aucs(y_t_val, y_p_val, label_cols,
-                                SKIP_EVAL_LABELS)
+                                min_positives=1)
         val_mean = np.mean(list(val_aucs.values())) if val_aucs else 0.0
 
         if epoch % 20 == 0 or epoch < 5:
@@ -498,20 +510,16 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
     lr_model.to(device)
 
     y_true_test, y_pred_test = evaluate_model(lr_model, test_loader, device)
-    test_aucs = compute_aucs(y_true_test, y_pred_test, label_cols,
-                             SKIP_EVAL_LABELS)
+    test_aucs = compute_aucs(y_true_test, y_pred_test, label_cols)
     test_mean = np.mean(list(test_aucs.values())) if test_aucs else 0.0
-    core_aucs = [test_aucs[c] for c in CORE_PHENOTYPES if c in test_aucs]
-    core_mean = np.mean(core_aucs) if core_aucs else 0.0
 
     print(f"  Seed {seed}: val={best_val_auc:.4f}  "
-          f"test={test_mean:.4f}  core={core_mean:.4f}")
+          f"test_macro={test_mean:.4f} ({len(test_aucs)} phenotypes)")
 
     return {
         'seed': seed,
         'best_val_auc': best_val_auc,
         'test_mean_auc': test_mean,
-        'test_core_auc': core_mean,
         'per_label_aucs': test_aucs,
         'y_true_test': y_true_test,
         'y_pred_test': y_pred_test,
@@ -586,7 +594,7 @@ def run_pipeline(args):
 
     print("=" * 70)
     print("Foundation Model Linear Probing on MIMIC-CXR")
-    print("  27 Opportunistic Screening Phenotypes")
+    print("  PheWAS Phenotypes (full evaluation)")
     print(f"  Models: {models_to_run}")
     print(f"  Seeds:  {args.n_seeds}")
     print(f"  Device: {device}")
@@ -594,7 +602,7 @@ def run_pipeline(args):
 
     # ---- Load split labels ----
     print("\n[Step 1] Loading MIMIC-CXR split labels ...")
-    splits = load_all_splits(args.labels_csv)
+    splits = load_all_splits(args.labels)
     train_df, train_labels, label_cols = splits['train']
     val_df, val_labels, _ = splits['validate']
     test_df, test_labels, _ = splits['test']
@@ -682,13 +690,10 @@ def run_pipeline(args):
 
         # ---- Aggregate ----
         test_aucs_all = [r['test_mean_auc'] for r in seed_results]
-        core_aucs_all = [r['test_core_auc'] for r in seed_results]
         val_aucs_all = [r['best_val_auc'] for r in seed_results]
 
         per_label_stats = {}
         for label in label_cols:
-            if label in SKIP_EVAL_LABELS:
-                continue
             la = [r['per_label_aucs'].get(label, np.nan) for r in seed_results]
             la = [a for a in la if not np.isnan(a)]
             if la:
@@ -697,6 +702,7 @@ def run_pipeline(args):
                     'std': float(np.std(la)),
                 }
 
+        n_eval = len(per_label_stats)
         model_summary = {
             'foundation_model': model_name,
             'feature_dim': feat_dim,
@@ -705,13 +711,11 @@ def run_pipeline(args):
             'n_train': len(train_labels),
             'n_val': len(val_labels),
             'n_test': len(test_labels),
-            'test_mean_auc': {
+            'n_phenotypes_total': len(label_cols),
+            'n_phenotypes_eval': n_eval,
+            'test_macro_auc': {
                 'mean': float(np.mean(test_aucs_all)),
                 'std': float(np.std(test_aucs_all)),
-            },
-            'test_core_auc': {
-                'mean': float(np.mean(core_aucs_all)),
-                'std': float(np.std(core_aucs_all)),
             },
             'val_auc': {
                 'mean': float(np.mean(val_aucs_all)),
@@ -725,16 +729,20 @@ def run_pipeline(args):
         print(f"Results: {model_name.upper()} (feat_dim={feat_dim}, "
               f"{args.n_seeds} seeds)")
         print(f"{'=' * 60}")
-        print(f"  Test AUC (all):  "
+        print(f"  Macro AUROC ({n_eval} phenotypes):  "
               f"{np.mean(test_aucs_all):.4f} +/- {np.std(test_aucs_all):.4f}")
-        print(f"  Test AUC (core): "
-              f"{np.mean(core_aucs_all):.4f} +/- {np.std(core_aucs_all):.4f}")
         print(f"  Val AUC:         "
               f"{np.mean(val_aucs_all):.4f} +/- {np.std(val_aucs_all):.4f}")
-        for label, st in per_label_stats.items():
-            marker = " *" if label in CORE_PHENOTYPES else ""
-            print(f"    {label:45s} "
-                  f"{st['mean']:.4f} +/- {st['std']:.4f}{marker}")
+
+        # Top/bottom 5
+        sorted_labels = sorted(per_label_stats.items(),
+                                key=lambda x: x[1]['mean'], reverse=True)
+        print(f"  Top 5:")
+        for label, st in sorted_labels[:5]:
+            print(f"    {label:20s} {st['mean']:.4f} +/- {st['std']:.4f}")
+        print(f"  Bottom 5:")
+        for label, st in sorted_labels[-5:]:
+            print(f"    {label:20s} {st['mean']:.4f} +/- {st['std']:.4f}")
 
         save_results(model_summary, seed_results, label_cols, output_dir,
                      model_name)
@@ -748,14 +756,13 @@ def run_pipeline(args):
         print(f"\n{'=' * 70}")
         print("COMPARISON SUMMARY")
         print(f"{'=' * 70}")
-        print(f"{'Model':20s} {'Core AUC':>15s} {'All AUC':>15s} {'Dim':>6s}")
-        print("-" * 60)
+        print(f"{'Model':20s} {'Macro AUROC':>15s} {'#Pheno':>8s} {'Dim':>6s}")
+        print("-" * 55)
         for mn, m in all_results.items():
-            c = m['test_core_auc']
-            a = m['test_mean_auc']
+            a = m['test_macro_auc']
             print(f"{mn:20s} "
-                  f"{c['mean']:.4f}+/-{c['std']:.4f} "
                   f"{a['mean']:.4f}+/-{a['std']:.4f} "
+                  f"{m['n_phenotypes_eval']:>8d} "
                   f"{m['feature_dim']:>6d}")
 
     return all_results
@@ -767,7 +774,7 @@ def run_pipeline(args):
 def parse_args():
     p = argparse.ArgumentParser(
         description="Foundation model linear probing on MIMIC-CXR "
-                    "(27 opportunistic screening phenotypes)")
+                    "(PheWAS phenotypes)")
 
     p.add_argument('--model', type=str, required=True,
                    choices=['ark_plus', 'rad_dino', 'chexzero',
@@ -775,7 +782,7 @@ def parse_args():
                    help='Foundation model to evaluate (or "all")')
 
     # Data paths
-    p.add_argument('--labels_csv', type=str, default=DEFAULT_LABELS_CSV)
+    p.add_argument('--labels', type=str, default=DEFAULT_LABELS)
     p.add_argument('--mimic_jpg_dir', type=str,
                    default=DEFAULT_MIMIC_JPG_DIR)
     p.add_argument('--h5_train', type=str, default=None)

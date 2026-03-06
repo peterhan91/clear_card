@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Zero-shot concept-based classification on MIMIC-CXR test set for 27 opportunistic
-screening phenotypes (CXR-Phenotype project).
+Zero-shot concept-based classification on MIMIC-CXR test set for 1,327 PheWAS
+phenotypes (following Merlin's full phenotype evaluation).
 
 Pipeline:
   1. Load finetuned ViT-7B LoRA CLIP model (DINOv3 backbone)
@@ -13,12 +13,12 @@ Pipeline:
   7. Project to LLM space: llm_repr = scores @ concept_embeddings  [N_images, emb_dim]
   8. Embed pos/neg class prompts in same LLM space  [N_labels, emb_dim] x 2
   9. Predict: P(label) = sigmoid(cos_sim(llm_repr, pos) - cos_sim(llm_repr, neg))
- 10. Evaluate AUC on 27 phenotype labels (exclude pulmonary_valve — 0 test positives)
+ 10. Evaluate per-phenotype AUROC, report macro-averaged AUROC
 
 Usage:
   python exp_zeroshot_mimic.py [--embedding_models openai_3large sfr_mistral]
                                [--model_path /path/to/best_model.pt]
-                               [--labels_csv data/mimic_opportunistic_labels.csv]
+                               [--labels data/mimic_phewas_labels.parquet]
                                [--mimic_jpg_dir /path/to/mimic-cxr-jpg/]
                                [--h5_path /path/to/mimic_test.h5]
 """
@@ -45,7 +45,6 @@ import h5py
 # Add training directory for model loading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'training'))
 from zero_shot import load_clip
-from eval import evaluate, bootstrap, compute_cis
 import clip as clip_module  # CLIP tokenizer
 
 # Add current directory for embedding utilities
@@ -54,55 +53,16 @@ from get_embed import RadiologyEmbeddingGenerator
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PHENOTYPE_LABELS = [
-    'heart_failure', 'hfref', 'hfpef', 'atrial_fibrillation',
-    'mitral_valve', 'aortic_valve', 'tricuspid_valve', 'pulmonary_valve',
-    'cad', 'myocardial_infarction', 'pulmonary_htn', 'stroke',
-    'copd', 'asthma', 'ild', 'lung_cancer', 'tuberculosis',
-    't2dm', 'obesity', 'dyslipidemia',
-    'osteoporosis', 'spinal_stenosis',
-    'hypertension', 'ckd', 'pvd', 'liver_cirrhosis', 'anemia',
-]
+# Metadata columns in the labels parquet (not phenotype labels)
+META_COLUMNS = {'dicom_id', 'subject_id', 'study_id', 'split',
+                'ViewPosition', 'icd_source'}
 
-# Labels with 0 test positives — cannot compute AUC
-SKIP_EVAL_LABELS = {'pulmonary_valve'}
+# Min test positives required to evaluate a phenotype
+MIN_TEST_POSITIVES = 20
 
-# Core phenotypes: cardiac + pulmonary, most CXR-relevant
-CORE_PHENOTYPES = [
-    'heart_failure', 'hfref', 'hfpef', 'atrial_fibrillation',
-    'cad', 'pulmonary_htn', 'copd', 'lung_cancer',
-]
-
-# Prompt mapping: snake_case -> readable medical terms
-LABEL_TO_PROMPT = {
-    'heart_failure': 'heart failure',
-    'hfref': 'heart failure with reduced ejection fraction',
-    'hfpef': 'heart failure with preserved ejection fraction',
-    'atrial_fibrillation': 'atrial fibrillation',
-    'mitral_valve': 'mitral valve disease',
-    'aortic_valve': 'aortic valve disease',
-    'tricuspid_valve': 'tricuspid valve disease',
-    'pulmonary_valve': 'pulmonary valve disease',
-    'cad': 'coronary artery disease',
-    'myocardial_infarction': 'myocardial infarction',
-    'pulmonary_htn': 'pulmonary hypertension',
-    'stroke': 'stroke',
-    'copd': 'chronic obstructive pulmonary disease',
-    'asthma': 'asthma',
-    'ild': 'interstitial lung disease',
-    'lung_cancer': 'lung cancer',
-    'tuberculosis': 'tuberculosis',
-    't2dm': 'type 2 diabetes',
-    'obesity': 'obesity',
-    'dyslipidemia': 'dyslipidemia',
-    'osteoporosis': 'osteoporosis',
-    'spinal_stenosis': 'spinal stenosis',
-    'hypertension': 'hypertension',
-    'ckd': 'chronic kidney disease',
-    'pvd': 'peripheral vascular disease',
-    'liver_cirrhosis': 'liver cirrhosis',
-    'anemia': 'anemia',
-}
+# Phecode info file for phenotype name lookup (used in prompts)
+PHECODE_INFO_CSV = os.path.join(os.path.dirname(__file__), '..', 'data',
+                                 'mimic_phecode_info.csv')
 
 # Best ViT-7B LoRA model (combined CheXpert+ReXGradient)
 DEFAULT_MODEL_PATH = (
@@ -111,8 +71,8 @@ DEFAULT_MODEL_PATH = (
 )
 
 # Data paths
-DEFAULT_LABELS_CSV = os.path.join(os.path.dirname(__file__), '..', 'data',
-                                   'mimic_opportunistic_labels.csv')
+DEFAULT_LABELS = os.path.join(os.path.dirname(__file__), '..', 'data',
+                               'mimic_phewas_labels.parquet')
 DEFAULT_MIMIC_JPG_DIR = "/cbica/projects/CXR/data_p/mimic-cxr-jpg/"
 
 # Concepts
@@ -224,7 +184,10 @@ class MIMICCXRDataset(Dataset):
         self.mimic_jpg_dir = mimic_jpg_dir
         self.transform = transform
 
-        df = pd.read_csv(labels_csv)
+        if labels_csv.endswith('.parquet'):
+            df = pd.read_parquet(labels_csv)
+        else:
+            df = pd.read_csv(labels_csv)
         df = df[df['split'] == split].reset_index(drop=True)
         self.df = df
         self.dicom_ids = df['dicom_id'].tolist()
@@ -286,7 +249,7 @@ class MIMICH5Dataset(Dataset):
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_test_data(labels_csv: str, mimic_jpg_dir: str,
+def load_test_data(labels_path: str, mimic_jpg_dir: str,
                    h5_path: str = None, batch_size: int = 32):
     """Load MIMIC-CXR test dataset and ground-truth labels."""
     transform = Compose([
@@ -298,7 +261,7 @@ def load_test_data(labels_csv: str, mimic_jpg_dir: str,
     if h5_path:
         dataset = MIMICH5Dataset(h5_path=h5_path, transform=transform)
     else:
-        dataset = MIMICCXRDataset(labels_csv=labels_csv,
+        dataset = MIMICCXRDataset(labels_csv=labels_path,
                                   mimic_jpg_dir=mimic_jpg_dir,
                                   split='test', transform=transform)
 
@@ -306,12 +269,13 @@ def load_test_data(labels_csv: str, mimic_jpg_dir: str,
                         num_workers=2, pin_memory=True)
 
     # Ground-truth labels
-    df = pd.read_csv(labels_csv)
-    df = df[df['split'] == 'test'].reset_index(drop=True)
-    label_cols = [c for c in PHENOTYPE_LABELS if c in df.columns]
-    y_true = df[label_cols].values.astype(float)
-    y_true = np.nan_to_num(y_true, nan=0.0)
-    y_true[y_true < 0] = 0.0
+    if labels_path.endswith('.parquet'):
+        full_df = pd.read_parquet(labels_path)
+    else:
+        full_df = pd.read_csv(labels_path)
+    df = full_df[full_df['split'] == 'test'].reset_index(drop=True)
+    label_cols = [c for c in full_df.columns if c not in META_COLUMNS]
+    y_true = df[label_cols].values.astype(np.float32)
 
     print(f"Test set: {len(dataset)} images, {len(label_cols)} labels")
     return loader, y_true, label_cols
@@ -453,23 +417,33 @@ def project_to_llm_space(concept_scores: torch.Tensor,
     return llm_repr  # [N_images, emb_dim]
 
 
-def get_prompt_texts(labels: List[str]):
+def load_phecode_names():
+    """Load phecode -> phenotype name mapping from info CSV."""
+    if os.path.exists(PHECODE_INFO_CSV):
+        info_df = pd.read_csv(PHECODE_INFO_CSV, dtype={"phecode": str})
+        return dict(zip(info_df['phecode'], info_df['phenotype']))
+    return {}
+
+
+def get_prompt_texts(labels: List[str], phecode_names: dict = None):
     """Generate positive and negative prompt texts for each label."""
+    phecode_names = phecode_names or {}
     pos_prompts = []
     neg_prompts = []
     for label in labels:
-        readable = LABEL_TO_PROMPT.get(label, label.replace('_', ' '))
+        readable = phecode_names.get(label, label.replace('_', ' '))
         pos_prompts.append(readable)
         neg_prompts.append(f"no {readable}")
     return pos_prompts, neg_prompts
 
 
-def generate_prompt_embeddings_local(model_key: str, labels: List[str]):
+def generate_prompt_embeddings_local(model_key: str, labels: List[str],
+                                     phecode_names: dict = None):
     """Generate LLM embeddings for pos/neg prompts using a local HuggingFace model."""
     info = EMBEDDING_MODELS[model_key]
     hf_name = info['hf_name']
 
-    pos_prompts, neg_prompts = get_prompt_texts(labels)
+    pos_prompts, neg_prompts = get_prompt_texts(labels, phecode_names)
     all_prompts = pos_prompts + neg_prompts
 
     print(f"  Generating {len(all_prompts)} prompt embeddings with {hf_name}")
@@ -499,27 +473,31 @@ def generate_prompt_embeddings_local(model_key: str, labels: List[str]):
     return pos_embeds, neg_embeds
 
 
-def generate_prompt_embeddings_openai(labels: List[str]):
+def generate_prompt_embeddings_openai(labels: List[str],
+                                      phecode_names: dict = None):
     """Generate embeddings for pos/neg prompts using OpenAI text-embedding-3-large."""
     from openai import OpenAI
 
     load_env()
     client = OpenAI()
 
-    pos_prompts, neg_prompts = get_prompt_texts(labels)
+    pos_prompts, neg_prompts = get_prompt_texts(labels, phecode_names)
     all_prompts = pos_prompts + neg_prompts
 
     print(f"  Generating {len(all_prompts)} prompt embeddings with OpenAI text-embedding-3-large")
 
-    response = client.embeddings.create(
-        model='text-embedding-3-large',
-        input=all_prompts,
-    )
+    # Batch API calls (OpenAI limit ~2048 per request)
+    api_batch_size = 2048
+    all_embeds = []
+    for i in range(0, len(all_prompts), api_batch_size):
+        batch = all_prompts[i:i + api_batch_size]
+        response = client.embeddings.create(
+            model='text-embedding-3-large',
+            input=batch,
+        )
+        all_embeds.extend([item.embedding for item in response.data])
 
-    embeddings = np.array(
-        [item.embedding for item in response.data],
-        dtype=np.float32,
-    )
+    embeddings = np.array(all_embeds, dtype=np.float32)
 
     n = len(labels)
     pos_embeds = torch.from_numpy(embeddings[:n])
@@ -531,13 +509,14 @@ def generate_prompt_embeddings_openai(labels: List[str]):
     return pos_embeds, neg_embeds
 
 
-def generate_prompt_embeddings(model_key: str, labels: List[str]):
+def generate_prompt_embeddings(model_key: str, labels: List[str],
+                               phecode_names: dict = None):
     """Dispatch to local or OpenAI prompt embedding generation."""
     info = EMBEDDING_MODELS[model_key]
     if info.get('prompt_mode') == 'openai_api':
-        return generate_prompt_embeddings_openai(labels)
+        return generate_prompt_embeddings_openai(labels, phecode_names)
     else:
-        return generate_prompt_embeddings_local(model_key, labels)
+        return generate_prompt_embeddings_local(model_key, labels, phecode_names)
 
 
 def predict(llm_repr: torch.Tensor,
@@ -566,81 +545,81 @@ def predict(llm_repr: torch.Tensor,
 # ---------------------------------------------------------------------------
 def evaluate_and_report(y_pred: np.ndarray, y_true: np.ndarray,
                         labels: List[str], model_key: str,
-                        n_concepts: int, run_bootstrap: bool = False):
+                        n_concepts: int, phecode_names: dict = None,
+                        run_bootstrap: bool = False):
     """Evaluate predictions, print results, return metrics dict."""
-    # Identify evaluable labels (skip those with 0 positives)
-    eval_mask = []
-    eval_labels = []
-    for i, label in enumerate(labels):
-        if label in SKIP_EVAL_LABELS:
-            eval_mask.append(False)
-            continue
-        n_pos = int(y_true[:, i].sum())
-        if n_pos == 0:
-            print(f"  Skipping {label}: 0 test positives")
-            eval_mask.append(False)
-        else:
-            eval_mask.append(True)
-            eval_labels.append(label)
+    from sklearn.metrics import roc_auc_score
+    phecode_names = phecode_names or {}
 
-    eval_indices = [i for i, m in enumerate(eval_mask) if m]
+    # Identify evaluable labels (need >= MIN_TEST_POSITIVES)
+    eval_labels = []
+    eval_indices = []
+    for i, label in enumerate(labels):
+        n_pos = int(y_true[:, i].sum())
+        if n_pos >= MIN_TEST_POSITIVES and n_pos < len(y_true):
+            eval_labels.append(label)
+            eval_indices.append(i)
+
     y_pred_eval = y_pred[:, eval_indices]
     y_true_eval = y_true[:, eval_indices]
 
-    results_df = evaluate(y_pred_eval, y_true_eval, eval_labels)
-
     # Per-label AUCs
     aucs = {}
-    for label in eval_labels:
-        col = f"{label}_auc"
-        if col in results_df.columns:
-            aucs[label] = float(results_df[col].iloc[0])
+    for j, label in enumerate(eval_labels):
+        aucs[label] = roc_auc_score(y_true_eval[:, j], y_pred_eval[:, j])
 
-    # Core-phenotype mean AUC
-    core_aucs = [aucs[c] for c in CORE_PHENOTYPES if c in aucs]
-    mean_core_auc = np.mean(core_aucs) if core_aucs else 0.0
     mean_all_auc = np.mean(list(aucs.values())) if aucs else 0.0
 
     print(f"\n{'='*60}")
     print(f"Results for {model_key.upper()} ({n_concepts} concepts)")
     print(f"{'='*60}")
-    print(f"  Mean AUC ({len(core_aucs)} core):  {mean_core_auc:.4f}")
-    print(f"  Mean AUC ({len(eval_labels)} eval):  {mean_all_auc:.4f}")
-    print(f"  Per-label AUCs:")
-    for label, auc_val in aucs.items():
-        marker = " *" if label in CORE_PHENOTYPES else ""
-        print(f"    {label:45s} {auc_val:.4f}{marker}")
+    print(f"  Macro AUROC ({len(eval_labels)} phenotypes):  {mean_all_auc:.4f}")
 
-    # Bootstrap CIs
-    cis_df = None
+    sorted_aucs = sorted(aucs.items(), key=lambda x: x[1], reverse=True)
+    print(f"  Top 5:")
+    for label, auc_val in sorted_aucs[:5]:
+        name = phecode_names.get(label, label)
+        print(f"    {label:10s} ({name:40s}) {auc_val:.4f}")
+    print(f"  Bottom 5:")
+    for label, auc_val in sorted_aucs[-5:]:
+        name = phecode_names.get(label, label)
+        print(f"    {label:10s} ({name:40s}) {auc_val:.4f}")
+
+    # Bootstrap CIs on macro AUROC
+    bootstrap_ci = None
     if run_bootstrap:
-        print("\n  Running bootstrap (1000 samples)...")
-        boot_stats, cis_df = bootstrap(y_pred_eval, y_true_eval, eval_labels,
-                                       n_samples=1000)
-        print("  Bootstrap 95% CIs:")
-        for label in eval_labels:
-            col = f"{label}_auc"
-            if col in cis_df.columns:
-                lo = cis_df[col]['lower']
-                hi = cis_df[col]['upper']
-                mn = cis_df[col]['mean']
-                print(f"    {label:45s} {mn:.4f} [{lo:.4f}, {hi:.4f}]")
+        print("\n  Running bootstrap (1000 samples) on macro AUROC...")
+        n_boot = 1000
+        rng = np.random.RandomState(42)
+        boot_macro = []
+        for _ in range(n_boot):
+            idx = rng.randint(0, len(y_true_eval), len(y_true_eval))
+            boot_aucs = []
+            for j in range(len(eval_labels)):
+                if y_true_eval[idx, j].sum() > 0:
+                    boot_aucs.append(roc_auc_score(
+                        y_true_eval[idx, j], y_pred_eval[idx, j]))
+            if boot_aucs:
+                boot_macro.append(np.mean(boot_aucs))
+        lo, hi = np.percentile(boot_macro, [2.5, 97.5])
+        bootstrap_ci = (lo, hi)
+        print(f"  Macro AUROC 95% CI: [{lo:.4f}, {hi:.4f}]")
 
     return {
         'model': model_key,
         'n_concepts': n_concepts,
-        'mean_core_auc': mean_core_auc,
-        'mean_all_auc': mean_all_auc,
+        'n_phenotypes_eval': len(eval_labels),
+        'macro_auroc': mean_all_auc,
         'per_label_aucs': aucs,
         'eval_labels': eval_labels,
-        'results_df': results_df,
-        'cis_df': cis_df,
+        'bootstrap_ci': bootstrap_ci,
     }
 
 
-def save_results(metrics: dict, y_pred: np.ndarray, y_true: np.ndarray,
-                 labels: List[str], output_dir: str, model_path: str):
+def save_results(metrics: dict, output_dir: str, model_path: str,
+                 phecode_names: dict = None):
     """Save evaluation results to disk."""
+    phecode_names = phecode_names or {}
     model_key = metrics['model']
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join(output_dir, f"zeroshot_mimic_{model_key}")
@@ -648,16 +627,12 @@ def save_results(metrics: dict, y_pred: np.ndarray, y_true: np.ndarray,
 
     summary = {
         'timestamp': ts,
-        'method': 'concept_zeroshot_mimic_phenotype',
+        'method': 'concept_zeroshot_mimic_phewas',
         'embedding_model': model_key,
         'n_concepts': metrics['n_concepts'],
-        'n_test_images': len(y_pred),
-        'n_labels': len(labels),
-        'n_eval_labels': len(metrics['eval_labels']),
-        'labels': labels,
-        'eval_labels': metrics['eval_labels'],
-        'mean_core_auc': metrics['mean_core_auc'],
-        'mean_all_auc': metrics['mean_all_auc'],
+        'n_phenotypes_eval': metrics['n_phenotypes_eval'],
+        'macro_auroc': metrics['macro_auroc'],
+        'bootstrap_ci_95': metrics.get('bootstrap_ci'),
         'per_label_aucs': metrics['per_label_aucs'],
         'model_path': model_path,
         'normalization': {'mean': [101.48761]*3, 'std': [83.43944]*3},
@@ -666,17 +641,11 @@ def save_results(metrics: dict, y_pred: np.ndarray, y_true: np.ndarray,
     with open(os.path.join(save_dir, f"summary_{ts}.json"), 'w') as f:
         json.dump(summary, f, indent=2)
 
-    pd.DataFrame(y_pred, columns=[f"{l}_pred" for l in labels]).to_csv(
-        os.path.join(save_dir, f"predictions_{ts}.csv"), index=False)
-    pd.DataFrame(y_true, columns=[f"{l}_true" for l in labels]).to_csv(
-        os.path.join(save_dir, f"ground_truth_{ts}.csv"), index=False)
-
-    metrics['results_df'].to_csv(
-        os.path.join(save_dir, f"detailed_aucs_{ts}.csv"), index=False)
-
-    if metrics['cis_df'] is not None:
-        metrics['cis_df'].to_csv(
-            os.path.join(save_dir, f"bootstrap_cis_{ts}.csv"))
+    # Save per-label AUC table
+    auc_rows = [{'phecode': l, 'phenotype': phecode_names.get(l, l),
+                 'auc': v} for l, v in metrics['per_label_aucs'].items()]
+    pd.DataFrame(auc_rows).to_csv(
+        os.path.join(save_dir, f"per_label_aucs_{ts}.csv"), index=False)
 
     print(f"  Results saved to {save_dir}/")
 
@@ -689,15 +658,18 @@ def run_zeroshot_pipeline(args):
 
     print("=" * 70)
     print("Concept-Based Zero-Shot Classification on MIMIC-CXR Test Set")
-    print("  27 Opportunistic Screening Phenotypes (CXR-Phenotype)")
+    print("  PheWAS Phenotypes (full evaluation)")
     print("  Model: DINOv3 ViT-7B + LoRA (r=32, alpha=64)")
     print(f"  Embedding models: {args.embedding_models}")
-    print(f"  Labels CSV: {args.labels_csv}")
+    print(f"  Labels: {args.labels}")
     if args.h5_path:
         print(f"  Image source: H5 ({args.h5_path})")
     else:
         print(f"  Image source: JPEG ({args.mimic_jpg_dir})")
     print("=" * 70)
+
+    # Load phecode name mapping
+    phecode_names = load_phecode_names()
 
     # Step 1: Load CLIP model
     print("\n[Step 1/6] Loading ViT-7B LoRA CLIP model...")
@@ -706,7 +678,7 @@ def run_zeroshot_pipeline(args):
     # Step 2: Load test data
     print("\n[Step 2/6] Loading MIMIC-CXR test data...")
     loader, y_true, label_cols = load_test_data(
-        labels_csv=args.labels_csv,
+        labels_path=args.labels,
         mimic_jpg_dir=args.mimic_jpg_dir,
         h5_path=args.h5_path,
         batch_size=args.image_batch_size,
@@ -767,11 +739,12 @@ def run_zeroshot_pipeline(args):
 
         # Generate prompt embeddings
         print("  Generating class prompt embeddings...")
-        pos_embeds, neg_embeds = generate_prompt_embeddings(model_key, label_cols)
+        pos_embeds, neg_embeds = generate_prompt_embeddings(
+            model_key, label_cols, phecode_names)
         print(f"  Pos embeddings: {pos_embeds.shape}, Neg: {neg_embeds.shape}")
 
         # Print prompt mapping for verification
-        pos_prompts, neg_prompts = get_prompt_texts(label_cols)
+        pos_prompts, neg_prompts = get_prompt_texts(label_cols, phecode_names)
         print(f"  Sample prompts: pos='{pos_prompts[0]}', neg='{neg_prompts[0]}'")
 
         # Predict
@@ -783,13 +756,13 @@ def run_zeroshot_pipeline(args):
         metrics = evaluate_and_report(
             y_pred, y_true, label_cols, model_key,
             n_concepts=len(concepts),
+            phecode_names=phecode_names,
             run_bootstrap=args.bootstrap,
         )
         all_metrics[model_key] = metrics
 
         # Save
-        save_results(metrics, y_pred, y_true, label_cols, output_dir,
-                     args.model_path)
+        save_results(metrics, output_dir, args.model_path, phecode_names)
 
         # Cleanup
         del concept_embeds, llm_repr, pos_embeds, neg_embeds, y_pred
@@ -800,10 +773,11 @@ def run_zeroshot_pipeline(args):
     print(f"\n{'='*70}")
     print("FINAL COMPARISON SUMMARY")
     print(f"{'='*70}")
-    print(f"{'Model':25s} {'Core AUC':>10s} {'All AUC':>10s}")
+    print(f"{'Model':25s} {'Macro AUROC':>12s} {'#Pheno':>8s}")
     print("-" * 50)
     for model_key, m in all_metrics.items():
-        print(f"{model_key:25s} {m['mean_core_auc']:10.4f} {m['mean_all_auc']:10.4f}")
+        print(f"{model_key:25s} {m['macro_auroc']:12.4f} "
+              f"{m['n_phenotypes_eval']:>8d}")
 
     return all_metrics
 
@@ -814,12 +788,12 @@ def run_zeroshot_pipeline(args):
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Zero-shot concept-based classification on MIMIC-CXR test set "
-                    "(27 opportunistic screening phenotypes)")
+                    "(PheWAS phenotypes)")
 
     parser.add_argument('--model_path', type=str, default=DEFAULT_MODEL_PATH,
                         help='Path to best_model.pt checkpoint')
-    parser.add_argument('--labels_csv', type=str, default=DEFAULT_LABELS_CSV,
-                        help='Path to MIMIC opportunistic labels CSV')
+    parser.add_argument('--labels', type=str, default=DEFAULT_LABELS,
+                        help='Path to labels parquet or CSV')
     parser.add_argument('--mimic_jpg_dir', type=str, default=DEFAULT_MIMIC_JPG_DIR,
                         help='Path to MIMIC-CXR JPEG directory')
     parser.add_argument('--h5_path', type=str, default=None,
@@ -843,7 +817,7 @@ def parse_args():
     parser.add_argument('--no_merge_lora', dest='merge_lora', action='store_false',
                         help='Keep LoRA weights separate')
     parser.add_argument('--bootstrap', action='store_true', default=False,
-                        help='Run bootstrap for confidence intervals')
+                        help='Run bootstrap for macro AUROC confidence interval')
     return parser.parse_args()
 
 
