@@ -53,14 +53,56 @@ import clip as clip_module
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PHENOTYPE_LABELS = None  # auto-detected from parquet phecode columns
-
-# Metadata columns in the labels parquet (not phenotype labels)
-META_COLUMNS = {'dicom_id', 'subject_id', 'study_id', 'split',
-                'ViewPosition', 'icd_source'}
+PHENOTYPE_LABELS = None  # auto-detected from label columns
 
 # Min test positives required to evaluate a phenotype
 MIN_TEST_POSITIVES = 20
+
+# Per-dataset configuration
+_DATA_ROOT = os.path.join(os.path.dirname(__file__), '..', 'data')
+
+DATASET_CONFIGS = {
+    'mimic': {
+        'default_labels': os.path.join(_DATA_ROOT, 'mimic_phewas_labels.parquet'),
+        'meta_columns': {'dicom_id', 'subject_id', 'study_id', 'split',
+                         'ViewPosition', 'icd_source'},
+        'image_id_col': 'dicom_id',
+        'patient_id_col': 'subject_id',
+        'val_split_name': 'validate',
+    },
+    'padchest': {
+        'default_labels': os.path.join(_DATA_ROOT, 'padchest_labels.csv'),
+        'meta_columns': {'ImageID', 'PatientID', 'StudyID', 'split',
+                         'PatientSex_DICOM', 'Projection', 'MethodLabel',
+                         'Report', 'h5_index'},
+        'image_id_col': 'ImageID',
+        'patient_id_col': 'PatientID',
+        'val_split_name': 'valid',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_1024_padchest', 'padchest_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_1024_padchest', 'padchest_valid.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_1024_padchest', 'padchest_test.h5'),
+        },
+    },
+    'chexchonet': {
+        'default_labels': os.path.join(_DATA_ROOT, 'chexchonet_labels.csv'),
+        'meta_columns': {'patient_id', 'split', 'cxr_filename',
+                         'cxr_time_offset', 'cxr_year', 'cxr_path',
+                         'cxr_pixel_spacing_x', 'cxr_pixel_spacing_y',
+                         'age', 'sex', 'ivsd', 'lvpwd', 'lvidd', 'h5_index'},
+        'label_columns': ['slvh', 'dlv', 'composite_slvh_dlv',
+                          'heart_transplant', 'lung_transplant',
+                          'pacemaker_or_icd'],
+        'image_id_col': 'cxr_filename',
+        'patient_id_col': 'patient_id',
+        'val_split_name': 'valid',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_224_chexchonet', 'chexchonet_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_224_chexchonet', 'chexchonet_valid.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_224_chexchonet', 'chexchonet_test.h5'),
+        },
+    },
+}
 
 # Best ViT-7B LoRA model (combined CheXpert+ReXGradient)
 DEFAULT_MODEL_PATH = (
@@ -69,8 +111,6 @@ DEFAULT_MODEL_PATH = (
 )
 
 # Data paths
-DEFAULT_LABELS = os.path.join(os.path.dirname(__file__), '..', 'data',
-                              'mimic_phewas_labels.parquet')
 DEFAULT_MIMIC_JPG_DIR = "/cbica/projects/CXR/data_p/mimic-cxr-jpg/"
 
 # Concepts
@@ -208,7 +248,7 @@ class MIMICCXRDataset(Dataset):
         img = np.array(img, dtype=np.float32)
         img = np.expand_dims(img, axis=0)
         img = np.repeat(img, 3, axis=0)
-        img = torch.from_numpy(img)
+        img = torch.from_numpy(img).clone()
         if self.transform:
             img = self.transform(img)
         return img
@@ -230,7 +270,7 @@ class MIMICH5Dataset(Dataset):
         img = self.img_dset[idx]
         img = np.expand_dims(img, axis=0)
         img = np.repeat(img, 3, axis=0)
-        img = torch.from_numpy(img)
+        img = torch.from_numpy(img).clone()
         if self.transform:
             img = self.transform(img)
         return img
@@ -243,40 +283,54 @@ class MIMICH5Dataset(Dataset):
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_all_splits(labels_path: str):
+def load_all_splits(labels_path: str, dataset: str = 'mimic'):
     """Load labels for all splits from parquet or CSV.
 
-    Auto-detects phecode columns (all columns not in META_COLUMNS).
+    Auto-detects label columns (all columns not in meta_columns), unless
+    the dataset config specifies explicit label_columns.
     Returns: dict of {split_name: (df, y_labels, label_cols)}
     """
+    config = DATASET_CONFIGS[dataset]
+    meta_cols = config['meta_columns']
+    patient_col = config['patient_id_col']
+    val_name = config['val_split_name']
+
     if labels_path.endswith('.parquet'):
         full_df = pd.read_parquet(labels_path)
     else:
         full_df = pd.read_csv(labels_path)
 
-    # Auto-detect phenotype columns
-    label_cols = [c for c in full_df.columns if c not in META_COLUMNS]
-    print(f"  Detected {len(label_cols)} phenotype columns")
+    # Determine label columns
+    if 'label_columns' in config:
+        label_cols = config['label_columns']
+    else:
+        label_cols = [c for c in full_df.columns if c not in meta_cols]
+    print(f"  Detected {len(label_cols)} label columns")
 
     # Safety checks
-    assert full_df['dicom_id'].duplicated().sum() == 0, "Duplicate dicom_ids in labels"
+    id_col = config.get('image_id_col')
+    if id_col and id_col in full_df.columns:
+        assert full_df[id_col].duplicated().sum() == 0, f"Duplicate {id_col}s"
     label_vals = full_df[label_cols].values
     assert label_vals.min() >= 0 and label_vals.max() <= 1, "Non-binary label values"
     assert not np.any(np.isnan(label_vals)), "NaN values in labels"
 
+    split_map = [('train', 'train'), ('validate', val_name), ('test', 'test')]
     splits = {}
-    for split in ['train', 'validate', 'test']:
-        df = full_df[full_df['split'] == split].reset_index(drop=True)
+    for key, csv_val in split_map:
+        df = full_df[full_df['split'] == csv_val].reset_index(drop=True)
+        if 'h5_index' in df.columns:
+            df = df.sort_values('h5_index').reset_index(drop=True)
         y = df[label_cols].values.astype(np.float32)
-        splits[split] = (df, y, label_cols)
+        splits[key] = (df, y, label_cols)
         n_pos_cols = (y.sum(axis=0) > 0).sum()
-        print(f"  {split}: {len(df)} images, {len(label_cols)} labels "
+        print(f"  {key}: {len(df)} images, {len(label_cols)} labels "
               f"({n_pos_cols} with >0 positives)")
 
     # Verify no patient overlap
     for s1, s2 in [('train', 'test'), ('train', 'validate'), ('validate', 'test')]:
-        p1 = set(splits[s1][0]['subject_id'])
-        p2 = set(splits[s2][0]['subject_id'])
+        p1 = set(splits[s1][0][patient_col])
+        p2 = set(splits[s2][0][patient_col])
         assert len(p1 & p2) == 0, f"Patient overlap between {s1} and {s2}"
     print("  No patient overlap between splits ✓")
 
@@ -295,7 +349,7 @@ def make_dataloader(df: pd.DataFrame, mimic_jpg_dir: str,
     transform = Compose([
         Normalize((101.48761, 101.48761, 101.48761),
                   (83.43944, 83.43944, 83.43944)),
-        Resize(448, interpolation=InterpolationMode.BICUBIC),
+        Resize((448, 448), interpolation=InterpolationMode.BICUBIC),
     ])
 
     if h5_path:
@@ -581,23 +635,23 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
 def run_linear_probing_pipeline(args):
     """Run the full concept-based supervised linear probing pipeline."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset = args.dataset
 
     print("=" * 70)
-    print("Concept-Based Supervised Linear Probing on MIMIC-CXR")
-    print("  PheWAS Phenotype Classification (1,327 phenotypes)")
+    print(f"Concept-Based Supervised Linear Probing on {dataset.upper()}")
     print("  Model: DINOv3 ViT-7B + LoRA (r=32, alpha=64)")
     print(f"  Embedding models: {args.embedding_models}")
     print(f"  Seeds: {args.n_seeds}")
     print(f"  Labels: {args.labels}")
-    print(f"  Image source: JPEG ({args.mimic_jpg_dir})")
-    if args.h5_train or args.h5_val or args.h5_test:
-        print(f"  H5 overrides: train={args.h5_train}, "
-              f"val={args.h5_val}, test={args.h5_test}")
+    if args.h5_train:
+        print(f"  Image source: H5")
+    else:
+        print(f"  Image source: JPEG ({args.mimic_jpg_dir})")
     print("=" * 70)
 
     # Step 1: Load split metadata
-    print("\n[Step 1/7] Loading MIMIC-CXR split labels...")
-    splits = load_all_splits(args.labels)
+    print(f"\n[Step 1/7] Loading {dataset.upper()} split labels...")
+    splits = load_all_splits(args.labels, dataset=dataset)
     train_df, train_labels, label_cols = splits['train']
     val_df, val_labels, _ = splits['validate']
     test_df, test_labels, _ = splits['test']
@@ -639,7 +693,7 @@ def run_linear_probing_pipeline(args):
     for split_name, (split_df, _) in splits_data.items():
         tag = get_cache_tag(args.model_path)
         cache_path = os.path.join(feature_cache_dir,
-                                  f"mimic_{split_name}_{tag}.pt")
+                                  f"{dataset}_{split_name}_{tag}.pt")
         if os.path.exists(cache_path) and not args.no_cache:
             print(f"  Loading cached {split_name} features from {cache_path}")
             image_features[split_name] = torch.load(cache_path,
@@ -764,7 +818,7 @@ def run_linear_probing_pipeline(args):
 
         # Save results
         save_results(model_summary, seed_results, label_cols, output_dir,
-                     model_key, args.model_path)
+                     model_key, args.model_path, dataset=dataset)
 
         all_model_results[model_key] = model_summary
 
@@ -792,10 +846,10 @@ def run_linear_probing_pipeline(args):
 # Saving results
 # ---------------------------------------------------------------------------
 def save_results(model_summary, seed_results, label_cols, output_dir,
-                 model_key, model_path):
+                 model_key, model_path, dataset='mimic'):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join(output_dir,
-                            f"linear_mimic_{model_key}")
+                            f"linear_{dataset}_{model_key}")
     os.makedirs(save_dir, exist_ok=True)
 
     # Summary JSON
@@ -860,10 +914,13 @@ def parse_args():
         description="Supervised concept-based linear probing on MIMIC-CXR "
                     "(PheWAS phenotypes)")
 
+    parser.add_argument('--dataset', type=str, default='mimic',
+                        choices=list(DATASET_CONFIGS.keys()),
+                        help='Dataset to evaluate (default: mimic)')
     parser.add_argument('--model_path', type=str, default=DEFAULT_MODEL_PATH,
                         help='Path to best_model.pt checkpoint')
-    parser.add_argument('--labels', type=str, default=DEFAULT_LABELS,
-                        help='Path to MIMIC PheWAS labels (parquet or CSV)')
+    parser.add_argument('--labels', type=str, default=None,
+                        help='Path to labels file (default: auto from --dataset)')
     parser.add_argument('--mimic_jpg_dir', type=str,
                         default=DEFAULT_MIMIC_JPG_DIR,
                         help='Path to MIMIC-CXR JPEG directory')
@@ -890,7 +947,22 @@ def parse_args():
                         action='store_false')
     parser.add_argument('--no_cache', action='store_true', default=False,
                         help='Disable feature caching')
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # Apply dataset defaults
+    config = DATASET_CONFIGS[args.dataset]
+    if args.labels is None:
+        args.labels = config['default_labels']
+    if 'default_h5' in config:
+        if args.h5_train is None:
+            args.h5_train = config['default_h5']['train']
+        if args.h5_val is None:
+            args.h5_val = config['default_h5']['val']
+        if args.h5_test is None:
+            args.h5_test = config['default_h5']['test']
+
+    return args
 
 
 if __name__ == "__main__":

@@ -46,15 +46,55 @@ from sklearn.metrics import roc_auc_score
 # ---------------------------------------------------------------------------
 # Constants  (shared with exp_linear_mimic.py)
 # ---------------------------------------------------------------------------
-# Metadata columns in the labels parquet (not phenotype labels)
-META_COLUMNS = {'dicom_id', 'subject_id', 'study_id', 'split',
-                'ViewPosition', 'icd_source'}
-
 # Min test positives required to evaluate a phenotype
 MIN_TEST_POSITIVES = 20
 
-DEFAULT_LABELS = os.path.join(
-    os.path.dirname(__file__), '..', 'data', 'mimic_phewas_labels.parquet')
+# Per-dataset configuration
+_DATA_ROOT = os.path.join(os.path.dirname(__file__), '..', 'data')
+
+DATASET_CONFIGS = {
+    'mimic': {
+        'default_labels': os.path.join(_DATA_ROOT, 'mimic_phewas_labels.parquet'),
+        'meta_columns': {'dicom_id', 'subject_id', 'study_id', 'split',
+                         'ViewPosition', 'icd_source'},
+        'image_id_col': 'dicom_id',
+        'patient_id_col': 'subject_id',
+        'val_split_name': 'validate',
+    },
+    'padchest': {
+        'default_labels': os.path.join(_DATA_ROOT, 'padchest_labels.csv'),
+        'meta_columns': {'ImageID', 'PatientID', 'StudyID', 'split',
+                         'PatientSex_DICOM', 'Projection', 'MethodLabel',
+                         'Report', 'h5_index'},
+        'image_id_col': 'ImageID',
+        'patient_id_col': 'PatientID',
+        'val_split_name': 'valid',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_1024_padchest', 'padchest_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_1024_padchest', 'padchest_valid.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_1024_padchest', 'padchest_test.h5'),
+        },
+    },
+    'chexchonet': {
+        'default_labels': os.path.join(_DATA_ROOT, 'chexchonet_labels.csv'),
+        'meta_columns': {'patient_id', 'split', 'cxr_filename',
+                         'cxr_time_offset', 'cxr_year', 'cxr_path',
+                         'cxr_pixel_spacing_x', 'cxr_pixel_spacing_y',
+                         'age', 'sex', 'ivsd', 'lvpwd', 'lvidd', 'h5_index'},
+        'label_columns': ['slvh', 'dlv', 'composite_slvh_dlv',
+                          'heart_transplant', 'lung_transplant',
+                          'pacemaker_or_icd'],
+        'image_id_col': 'cxr_filename',
+        'patient_id_col': 'patient_id',
+        'val_split_name': 'valid',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_224_chexchonet', 'chexchonet_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_224_chexchonet', 'chexchonet_valid.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_224_chexchonet', 'chexchonet_test.h5'),
+        },
+    },
+}
+
 DEFAULT_MIMIC_JPG_DIR = "/cbica/projects/CXR/data_p/mimic-cxr-jpg/"
 
 # Training hyper-parameters (identical to concept-based linear probing)
@@ -368,42 +408,56 @@ def encode_images(model_name, model, loader, device):
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_all_splits(labels_path):
+def load_all_splits(labels_path, dataset='mimic'):
     """Load labels for all splits from parquet or CSV.
 
-    Auto-detects phecode columns (all columns not in META_COLUMNS).
+    Auto-detects label columns (all columns not in meta_columns), unless
+    the dataset config specifies explicit label_columns.
     Returns: dict of {split_name: (df, y_labels, label_cols)}
     """
+    config = DATASET_CONFIGS[dataset]
+    meta_cols = config['meta_columns']
+    patient_col = config['patient_id_col']
+    val_name = config['val_split_name']
+
     if labels_path.endswith('.parquet'):
         full_df = pd.read_parquet(labels_path)
     else:
         full_df = pd.read_csv(labels_path)
 
-    # Auto-detect phenotype columns
-    label_cols = [c for c in full_df.columns if c not in META_COLUMNS]
-    print(f"  Detected {len(label_cols)} phenotype columns")
+    # Determine label columns
+    if 'label_columns' in config:
+        label_cols = config['label_columns']
+    else:
+        label_cols = [c for c in full_df.columns if c not in meta_cols]
+    print(f"  Detected {len(label_cols)} label columns")
 
     # Safety checks
-    assert full_df['dicom_id'].duplicated().sum() == 0, "Duplicate dicom_ids in labels"
+    id_col = config.get('image_id_col')
+    if id_col and id_col in full_df.columns:
+        assert full_df[id_col].duplicated().sum() == 0, f"Duplicate {id_col}s"
     label_vals = full_df[label_cols].values
     assert label_vals.min() >= 0 and label_vals.max() <= 1, "Non-binary label values"
     assert not np.any(np.isnan(label_vals)), "NaN values in labels"
 
+    split_map = [('train', 'train'), ('validate', val_name), ('test', 'test')]
     splits = {}
-    for split in ['train', 'validate', 'test']:
-        df = full_df[full_df['split'] == split].reset_index(drop=True)
+    for key, csv_val in split_map:
+        df = full_df[full_df['split'] == csv_val].reset_index(drop=True)
+        if 'h5_index' in df.columns:
+            df = df.sort_values('h5_index').reset_index(drop=True)
         y = df[label_cols].values.astype(np.float32)
-        splits[split] = (df, y, label_cols)
+        splits[key] = (df, y, label_cols)
         n_pos_cols = (y.sum(axis=0) > 0).sum()
-        print(f"  {split}: {len(df)} images, {len(label_cols)} labels "
+        print(f"  {key}: {len(df)} images, {len(label_cols)} labels "
               f"({n_pos_cols} with >0 positives)")
 
     # Verify no patient overlap
     for s1, s2 in [('train', 'test'), ('train', 'validate'), ('validate', 'test')]:
-        p1 = set(splits[s1][0]['subject_id'])
-        p2 = set(splits[s2][0]['subject_id'])
+        p1 = set(splits[s1][0][patient_col])
+        p2 = set(splits[s2][0][patient_col])
         assert len(p1 & p2) == 0, f"Patient overlap between {s1} and {s2}"
-    print("  No patient overlap between splits")
+    print("  No patient overlap between splits ✓")
 
     return splits
 
@@ -532,10 +586,10 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
 # Results saving
 # ---------------------------------------------------------------------------
 def save_results(model_summary, seed_results, label_cols, output_dir,
-                 model_name):
+                 model_name, dataset='mimic'):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join(output_dir,
-                            f"linear_mimic_foundation_{model_name}")
+                            f"linear_{dataset}_foundation_{model_name}")
     os.makedirs(save_dir, exist_ok=True)
 
     summary = {
@@ -592,17 +646,18 @@ def run_pipeline(args):
     models_to_run = (['ark_plus', 'rad_dino', 'chexzero', 'biomedclip']
                      if args.model == 'all' else [args.model])
 
+    dataset = args.dataset
+
     print("=" * 70)
-    print("Foundation Model Linear Probing on MIMIC-CXR")
-    print("  PheWAS Phenotypes (full evaluation)")
+    print(f"Foundation Model Linear Probing on {dataset.upper()}")
     print(f"  Models: {models_to_run}")
     print(f"  Seeds:  {args.n_seeds}")
     print(f"  Device: {device}")
     print("=" * 70)
 
     # ---- Load split labels ----
-    print("\n[Step 1] Loading MIMIC-CXR split labels ...")
-    splits = load_all_splits(args.labels)
+    print(f"\n[Step 1] Loading {dataset.upper()} split labels ...")
+    splits = load_all_splits(args.labels, dataset=dataset)
     train_df, train_labels, label_cols = splits['train']
     val_df, val_labels, _ = splits['validate']
     test_df, test_labels, _ = splits['test']
@@ -645,7 +700,7 @@ def run_pipeline(args):
 
         for split_name, (split_df, _) in splits_data.items():
             cache_path = os.path.join(
-                cache_dir, f"mimic_{split_name}_{model_name}.pt")
+                cache_dir, f"{dataset}_{split_name}_{model_name}.pt")
 
             if os.path.exists(cache_path) and not args.no_cache:
                 print(f"  Loading cached {split_name} features: {cache_path}")
@@ -745,7 +800,7 @@ def run_pipeline(args):
             print(f"    {label:20s} {st['mean']:.4f} +/- {st['std']:.4f}")
 
         save_results(model_summary, seed_results, label_cols, output_dir,
-                     model_name)
+                     model_name, dataset=dataset)
         all_results[model_name] = model_summary
 
         del split_repr
@@ -776,13 +831,17 @@ def parse_args():
         description="Foundation model linear probing on MIMIC-CXR "
                     "(PheWAS phenotypes)")
 
+    p.add_argument('--dataset', type=str, default='mimic',
+                   choices=list(DATASET_CONFIGS.keys()),
+                   help='Dataset to evaluate (default: mimic)')
     p.add_argument('--model', type=str, required=True,
                    choices=['ark_plus', 'rad_dino', 'chexzero',
                             'biomedclip', 'all'],
                    help='Foundation model to evaluate (or "all")')
 
     # Data paths
-    p.add_argument('--labels', type=str, default=DEFAULT_LABELS)
+    p.add_argument('--labels', type=str, default=None,
+                   help='Path to labels file (default: auto from --dataset)')
     p.add_argument('--mimic_jpg_dir', type=str,
                    default=DEFAULT_MIMIC_JPG_DIR)
     p.add_argument('--h5_train', type=str, default=None)
@@ -802,7 +861,21 @@ def parse_args():
     p.add_argument('--no_cache', action='store_true',
                    help='Re-encode images even if cache exists')
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Apply dataset defaults
+    config = DATASET_CONFIGS[args.dataset]
+    if args.labels is None:
+        args.labels = config['default_labels']
+    if 'default_h5' in config:
+        if args.h5_train is None:
+            args.h5_train = config['default_h5']['train']
+        if args.h5_val is None:
+            args.h5_val = config['default_h5']['val']
+        if args.h5_test is None:
+            args.h5_test = config['default_h5']['test']
+
+    return args
 
 
 if __name__ == "__main__":
