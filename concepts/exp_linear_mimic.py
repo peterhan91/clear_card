@@ -571,7 +571,8 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
 
     # Training loop with early stopping
     best_val_auc = 0.0
-    best_model_state = None
+    best_model_state = {k: v.cpu().clone()
+                        for k, v in lr_model.state_dict().items()}
     patience_counter = 0
 
     for epoch in range(MAX_EPOCHS):
@@ -581,7 +582,7 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
         # Validation
         y_true_val, y_pred_val = evaluate_model(lr_model, val_loader, device)
         val_aucs = compute_aucs(y_true_val, y_pred_val, label_cols,
-                                None)
+                                min_positives=1)
         val_mean_auc = np.mean(list(val_aucs.values())) if val_aucs else 0.0
 
         if epoch % 20 == 0 or epoch < 5:
@@ -606,8 +607,7 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
 
     # Evaluate on test set
     y_true_test, y_pred_test = evaluate_model(lr_model, test_loader, device)
-    test_aucs = compute_aucs(y_true_test, y_pred_test, label_cols,
-                             None)
+    test_aucs = compute_aucs(y_true_test, y_pred_test, label_cols)
     test_mean_auc = np.mean(list(test_aucs.values())) if test_aucs else 0.0
 
     print(f"  Seed {seed}: val_AUC={best_val_auc:.4f}  "
