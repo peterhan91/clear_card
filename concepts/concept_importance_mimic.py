@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Concept importance analysis for MIMIC-CXR opportunistic phenotype linear probes.
+Concept importance analysis for MIMIC-CXR PheWAS phenotype linear probes.
 
-For each of the 27 phenotype labels, computes which radiological concepts are
+For each evaluated phenotype label, computes which radiological concepts are
 most positively / negatively aligned with the trained linear weight vector.
 
   importance(concept_i, label_j) = cos_sim(W_j, E_i)
@@ -14,9 +14,9 @@ Supports aggregation across multiple random seeds (mean alignment).
 
 Usage:
   # After running exp_linear_mimic.py:
-  python concept_importance_mimic.py --results_dir results/linear_mimic_openai_3large
-  python concept_importance_mimic.py --results_dir results/linear_mimic_sfr_mistral --top_k 50
-  python concept_importance_mimic.py --results_dir results/linear_mimic_openai_3large --seed 42
+  python concept_importance_mimic.py --results_dir results/linear_mimic_kalm_gemma3_12b
+  python concept_importance_mimic.py --results_dir results/linear_mimic_kalm_gemma3_12b --top_k 50
+  python concept_importance_mimic.py --results_dir results/linear_mimic_kalm_gemma3_12b --seed 42
 """
 import os
 import sys
@@ -34,39 +34,20 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 from exp_linear_mimic import (
     LogisticRegressionModel, EMBEDDING_MODELS, EMBEDDINGS_DIR,
-    CONCEPTS_CSV, SKIP_EVAL_LABELS, CORE_PHENOTYPES,
+    CONCEPTS_CSV, MIN_TEST_POSITIVES,
 )
 
-# Human-readable label names
-LABEL_TO_PROMPT = {
-    'heart_failure': 'heart failure',
-    'hfref': 'heart failure with reduced ejection fraction',
-    'hfpef': 'heart failure with preserved ejection fraction',
-    'atrial_fibrillation': 'atrial fibrillation',
-    'mitral_valve': 'mitral valve disease',
-    'aortic_valve': 'aortic valve disease',
-    'tricuspid_valve': 'tricuspid valve disease',
-    'pulmonary_valve': 'pulmonary valve disease',
-    'cad': 'coronary artery disease',
-    'myocardial_infarction': 'myocardial infarction',
-    'pulmonary_htn': 'pulmonary hypertension',
-    'stroke': 'stroke',
-    'copd': 'chronic obstructive pulmonary disease',
-    'asthma': 'asthma',
-    'ild': 'interstitial lung disease',
-    'lung_cancer': 'lung cancer',
-    'tuberculosis': 'tuberculosis',
-    't2dm': 'type 2 diabetes',
-    'obesity': 'obesity',
-    'dyslipidemia': 'dyslipidemia',
-    'osteoporosis': 'osteoporosis',
-    'spinal_stenosis': 'spinal stenosis',
-    'hypertension': 'hypertension',
-    'ckd': 'chronic kidney disease',
-    'pvd': 'peripheral vascular disease',
-    'liver_cirrhosis': 'liver cirrhosis',
-    'anemia': 'anemia',
-}
+# Phecode info for human-readable names
+PHECODE_INFO_PATH = os.path.join(os.path.dirname(__file__), '..', 'data',
+                                  'mimic_phecode_info.csv')
+
+
+def load_phecode_info():
+    """Load phecode -> phenotype name mapping."""
+    if not os.path.exists(PHECODE_INFO_PATH):
+        return {}
+    df = pd.read_csv(PHECODE_INFO_PATH, dtype={'phecode': str})
+    return dict(zip(df['phecode'], df['phenotype']))
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +114,6 @@ def load_concept_embeddings(model_key: str, concept_indices: List[int],
 def detect_embedding_model(results_dir: str) -> str:
     """Detect which embedding model was used from the results directory name."""
     dirname = os.path.basename(results_dir)
-    # Directory format: linear_mimic_{model_key}
     for key in EMBEDDING_MODELS:
         if key in dirname:
             return key
@@ -143,10 +123,7 @@ def detect_embedding_model(results_dir: str) -> str:
 
 def load_trained_models(results_dir: str,
                         seed: Optional[int] = None) -> List[dict]:
-    """Load trained linear probe model checkpoints.
-
-    If seed is specified, loads only that seed. Otherwise loads all.
-    """
+    """Load trained linear probe model checkpoints."""
     models_dir = os.path.join(results_dir, 'models')
     if not os.path.isdir(models_dir):
         raise FileNotFoundError(f"Models directory not found: {models_dir}")
@@ -158,7 +135,6 @@ def load_trained_models(results_dir: str,
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         return [ckpt]
 
-    # Load all seeds
     pattern = os.path.join(models_dir, "seed_*_model.pth")
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -193,52 +169,42 @@ def compute_concept_importance(weight_matrix: np.ndarray,
                                 concepts: List[str],
                                 concept_indices: List[int],
                                 top_k: int = 100,
-                                per_label_aucs: Optional[dict] = None):
+                                per_label_aucs: Optional[dict] = None,
+                                phecode_names: Optional[dict] = None):
     """
     Compute concept importance for each label via cosine similarity
     between the label's weight vector and each concept embedding.
 
-    Args:
-        weight_matrix: [N_labels, emb_dim] - linear layer weights
-        concept_embeddings: [N_concepts, emb_dim] - LLM concept embeddings
-        labels: list of label names
-        concepts: list of concept text strings
-        concept_indices: list of concept integer IDs
-        top_k: number of top positive/negative concepts per label
-        per_label_aucs: optional dict of {label: auc} for metadata
-
     Returns:
         dict of {label: {positive_concepts, negative_concepts, stats}}
     """
+    phecode_names = phecode_names or {}
+
     # Vectorized cosine similarity: [N_labels, N_concepts]
-    # Normalize weight vectors
     w_norms = np.linalg.norm(weight_matrix, axis=1, keepdims=True)
     w_norms = np.clip(w_norms, 1e-8, None)
     w_normed = weight_matrix / w_norms
 
-    # Normalize concept embeddings
     e_norms = np.linalg.norm(concept_embeddings, axis=1, keepdims=True)
     e_norms = np.clip(e_norms, 1e-8, None)
     e_normed = concept_embeddings / e_norms
 
-    # Cosine similarity matrix
     alignments = w_normed @ e_normed.T  # [N_labels, N_concepts]
 
     importance = {}
     for label_idx, label in enumerate(labels):
-        if label in SKIP_EVAL_LABELS:
+        # Skip labels without sufficient AUC data
+        if per_label_aucs and label not in per_label_aucs:
             continue
 
-        align = alignments[label_idx]  # [N_concepts]
+        align = alignments[label_idx]
 
-        # Separate positive and negative
         pos_mask = align > 0
         neg_mask = align < 0
 
         pos_indices = np.where(pos_mask)[0]
         neg_indices = np.where(neg_mask)[0]
 
-        # Sort: positive descending, negative ascending (most negative first)
         pos_sorted = pos_indices[np.argsort(align[pos_indices])[::-1]]
         neg_sorted = neg_indices[np.argsort(align[neg_indices])]
 
@@ -260,9 +226,9 @@ def compute_concept_importance(weight_matrix: np.ndarray,
             for idx in neg_sorted[:top_k]
         ]
 
+        label_readable = phecode_names.get(label, label)
         stats = {
-            'label_readable': LABEL_TO_PROMPT.get(label, label),
-            'is_core': label in CORE_PHENOTYPES,
+            'label_readable': label_readable,
             'total_positive': int(len(pos_indices)),
             'total_negative': int(len(neg_indices)),
             'max_positive': float(align[pos_sorted[0]]) if len(pos_sorted) > 0 else 0.0,
@@ -276,19 +242,6 @@ def compute_concept_importance(weight_matrix: np.ndarray,
             'negative_concepts': top_negative,
             'stats': stats,
         }
-
-        # Print summary
-        marker = " *" if label in CORE_PHENOTYPES else ""
-        print(f"\n{label}{marker}: {len(pos_indices)} pos, "
-              f"{len(neg_indices)} neg concepts")
-
-        print(f"  Top 5 Positive:")
-        for i, c in enumerate(top_positive[:5]):
-            print(f"    {i+1}. +{c['alignment']:.4f} | {c['concept'][:70]}")
-
-        print(f"  Top 5 Negative:")
-        for i, c in enumerate(top_negative[:5]):
-            print(f"    {i+1}. {c['alignment']:.4f} | {c['concept'][:70]}")
 
     return importance
 
@@ -328,24 +281,22 @@ def save_importance(importance: dict, output_dir: str, model_key: str):
     for label, data in importance.items():
         for c in data['positive_concepts']:
             rows.append({
-                'label': label,
-                'label_readable': data['stats']['label_readable'],
+                'phecode': label,
+                'phenotype': data['stats']['label_readable'],
                 'direction': 'positive',
                 'concept': c['concept'],
                 'concept_idx': c['concept_idx'],
                 'alignment': c['alignment'],
-                'is_core': data['stats']['is_core'],
                 'auc': data['stats'].get('auc', np.nan),
             })
         for c in data['negative_concepts']:
             rows.append({
-                'label': label,
-                'label_readable': data['stats']['label_readable'],
+                'phecode': label,
+                'phenotype': data['stats']['label_readable'],
                 'direction': 'negative',
                 'concept': c['concept'],
                 'concept_idx': c['concept_idx'],
                 'alignment': c['alignment'],
-                'is_core': data['stats']['is_core'],
                 'auc': data['stats'].get('auc', np.nan),
             })
 
@@ -367,6 +318,9 @@ def run_importance_analysis(args):
     # Detect embedding model
     model_key = args.embedding_model or detect_embedding_model(results_dir)
     print(f"Embedding model: {model_key}")
+
+    # Load phecode info for readable names
+    phecode_names = load_phecode_info()
 
     # Load summary for per-label AUCs
     summary = load_summary(results_dir)
@@ -406,13 +360,29 @@ def run_importance_analysis(args):
 
     # Compute importance
     print(f"\nComputing concept importance (top {args.top_k} per label)...")
+    print(f"  {len(per_label_aucs)} phenotypes with AUC data")
     print("=" * 70)
     importance = compute_concept_importance(
         weight_matrix, concept_embeddings,
         labels, concepts, concept_indices,
         top_k=args.top_k,
         per_label_aucs=per_label_aucs,
+        phecode_names=phecode_names,
     )
+
+    # Print top 10 by AUC with their best concept
+    sorted_by_auc = sorted(
+        importance.items(),
+        key=lambda x: x[1]['stats'].get('auc', 0),
+        reverse=True,
+    )
+    print(f"\nTop 10 phenotypes by AUC with their top concept:")
+    for phecode, data in sorted_by_auc[:10]:
+        auc_val = data['stats'].get('auc', 0)
+        top_concept = data['positive_concepts'][0]['concept'] if data['positive_concepts'] else 'N/A'
+        name = data['stats']['label_readable']
+        print(f"  {phecode:>10s} ({name[:30]:30s}) AUC={auc_val:.3f}  "
+              f"top: {top_concept[:50]}")
 
     # Save
     output_dir = os.path.join(results_dir, 'concept_importance')
@@ -422,7 +392,7 @@ def run_importance_analysis(args):
     print("CONCEPT IMPORTANCE ANALYSIS COMPLETE")
     print(f"  Embedding model: {model_key}")
     print(f"  Seeds averaged: {len(checkpoints)}")
-    print(f"  Labels analyzed: {len(importance)}")
+    print(f"  Phenotypes analyzed: {len(importance)}")
     print(f"  Top-k per direction: {args.top_k}")
     print(f"{'=' * 60}")
 
@@ -430,11 +400,11 @@ def run_importance_analysis(args):
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Concept importance analysis for MIMIC-CXR "
-                    "opportunistic phenotype linear probes")
+                    "PheWAS phenotype linear probes")
 
     parser.add_argument('--results_dir', type=str, required=True,
                         help='Path to linear probing results directory '
-                             '(e.g., results/linear_mimic_openai_3large)')
+                             '(e.g., results/linear_mimic_kalm_gemma3_12b)')
     parser.add_argument('--embedding_model', type=str, default=None,
                         choices=list(EMBEDDING_MODELS.keys()),
                         help='Embedding model (auto-detected from dir name)')

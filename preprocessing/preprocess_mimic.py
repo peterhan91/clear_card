@@ -4,7 +4,7 @@ Preprocess MIMIC-CXR JPEGs into per-split H5 files for the PheWAS
 phenotype experiments.
 
 Reads mimic_phewas_labels.parquet (which has a 'split' column with
-train/validate/test from a custom patient-level 40/10/50 split),
+train/validate/test from the official MIMIC-CXR 2.0.0 split),
 resolves JPEG paths, and converts each split into an H5 file via
 img_to_hdf5_parallel.
 

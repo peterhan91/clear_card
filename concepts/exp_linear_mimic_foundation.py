@@ -60,6 +60,25 @@ DATASET_CONFIGS = {
         'image_id_col': 'dicom_id',
         'patient_id_col': 'subject_id',
         'val_split_name': 'validate',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_validate.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_test.h5'),
+        },
+    },
+    'mimic63': {
+        'default_labels': os.path.join(_DATA_ROOT, 'mimic_63label_labels.parquet'),
+        'meta_columns': {'dicom_id', 'subject_id', 'study_id', 'split',
+                         'ViewPosition', 'icd_source'},
+        'image_id_col': 'dicom_id',
+        'patient_id_col': 'subject_id',
+        'val_split_name': 'validate',
+        'cache_prefix': 'mimic',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_validate.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_test.h5'),
+        },
     },
     'padchest': {
         'default_labels': os.path.join(_DATA_ROOT, 'padchest_labels.csv'),
@@ -235,7 +254,8 @@ def _build_ark_swin(num_classes_list, projector_features, **swin_kwargs):
             ])
 
         def generate_embeddings(self, x, after_proj=True):
-            x = self.forward_features(x)
+            x = self.forward_features(x)          # [B, H, W, C]
+            x = x.mean(dim=(1, 2))                # global avg pool -> [B, C]
             if after_proj and self.projector is not None:
                 x = self.projector(x)
             return x
@@ -263,6 +283,20 @@ def load_ark_plus(checkpoint_path, device):
     if any('module.' in k for k in state_dict.keys()):
         state_dict = {k.replace('module.', ''): v
                       for k, v in state_dict.items()}
+    # timm >= 1.0 moved downsample from end of stage i to start of stage i+1;
+    # remap old-style checkpoint keys: layers.{i}.downsample -> layers.{i+1}.downsample
+    import re
+    remapped = {}
+    for k, v in state_dict.items():
+        m = re.match(r'layers\.(\d+)\.downsample\.(.*)', k)
+        if m:
+            new_key = f'layers.{int(m.group(1)) + 1}.downsample.{m.group(2)}'
+            if new_key in dict(model.named_parameters()) or \
+               new_key in dict(model.named_buffers()):
+                remapped[new_key] = v
+                continue
+        remapped[k] = v
+    state_dict = remapped
     msg = model.load_state_dict(state_dict, strict=False)
     print(f"  Ark+ loaded (missing={len(msg.missing_keys)}, "
           f"unexpected={len(msg.unexpected_keys)})")
@@ -698,9 +732,10 @@ def run_pipeline(args):
         batch_size = args.image_batch_size or DEFAULT_BATCH_SIZES[model_name]
         image_features = {}
 
+        cache_dataset = DATASET_CONFIGS[dataset].get('cache_prefix', dataset)
         for split_name, (split_df, _) in splits_data.items():
             cache_path = os.path.join(
-                cache_dir, f"{dataset}_{split_name}_{model_name}.pt")
+                cache_dir, f"{cache_dataset}_{split_name}_{model_name}.pt")
 
             if os.path.exists(cache_path) and not args.no_cache:
                 print(f"  Loading cached {split_name} features: {cache_path}")
@@ -723,6 +758,10 @@ def run_pipeline(args):
         torch.cuda.empty_cache()
         gc.collect()
         print_gpu_memory("after freeing vision model")
+
+        if args.cache_only:
+            print(f"\n  [cache_only] {model_name} features cached. Skipping linear probing.")
+            continue
 
         # ---- Train linear probes ----
         print(f"\n  Training linear probes ({args.n_seeds} seeds, "
@@ -860,6 +899,8 @@ def parse_args():
                    help='Override per-model default batch size')
     p.add_argument('--no_cache', action='store_true',
                    help='Re-encode images even if cache exists')
+    p.add_argument('--cache_only', action='store_true',
+                   help='Only extract and cache features, skip linear probing')
 
     args = p.parse_args()
 

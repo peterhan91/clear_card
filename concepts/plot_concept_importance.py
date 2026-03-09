@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
-Concept importance visualization for MIMIC-CXR opportunistic phenotype
-linear probes.
+Concept importance visualization for MIMIC-CXR PheWAS phenotype linear probes.
 
 Loads per-seed model checkpoints and concept embeddings, computes concept
 importance (cosine similarity between linear weights and LLM embeddings)
-for each seed, then creates publication-quality horizontal bar charts with:
-  - Top 10 positive concepts per phenotype
+for each seed, then creates horizontal bar charts with:
+  - Top-k positive concepts per phenotype
   - Error bars (std across seeds)
   - Individual seed data points as open circles
-
-Adapted from cxr_concept/concepts/plot_linear_probing_concepts.py for the
-CLEAR pipeline with 27 MIMIC-CXR phenotypes and 5 seeds.
 
 Usage:
   python plot_concept_importance.py
   python plot_concept_importance.py --results_dir results/linear_mimic_kalm_gemma3_12b
-  python plot_concept_importance.py --labels heart_failure copd lung_cancer
-  python plot_concept_importance.py --top_k 15 --all_labels
+  python plot_concept_importance.py --phecodes 428.1 496.0 162.0
+  python plot_concept_importance.py --top_k 15 --n_phenotypes 30
 """
 
 import os
 import sys
 import glob
+import json
 import pickle
 import argparse
 
@@ -32,46 +29,26 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# Add parent directory for model imports
 sys.path.insert(0, os.path.dirname(__file__))
 from exp_linear_mimic import (
     LogisticRegressionModel, EMBEDDING_MODELS, EMBEDDINGS_DIR,
-    CONCEPTS_CSV, SKIP_EVAL_LABELS, CORE_PHENOTYPES,
+    CONCEPTS_CSV,
 )
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LABEL_DISPLAY = {
-    'heart_failure': 'Heart Failure',
-    'hfref': 'HFrEF',
-    'hfpef': 'HFpEF',
-    'atrial_fibrillation': 'Atrial Fibrillation',
-    'mitral_valve': 'Mitral Valve Disease',
-    'aortic_valve': 'Aortic Valve Disease',
-    'tricuspid_valve': 'Tricuspid Valve Disease',
-    'cad': 'Coronary Artery Disease',
-    'myocardial_infarction': 'Myocardial Infarction',
-    'pulmonary_htn': 'Pulmonary Hypertension',
-    'stroke': 'Stroke',
-    'copd': 'COPD',
-    'asthma': 'Asthma',
-    'ild': 'Interstitial Lung Disease',
-    'lung_cancer': 'Lung Cancer',
-    'tuberculosis': 'Tuberculosis',
-    't2dm': 'Type 2 Diabetes',
-    'obesity': 'Obesity',
-    'dyslipidemia': 'Dyslipidemia',
-    'osteoporosis': 'Osteoporosis',
-    'spinal_stenosis': 'Spinal Stenosis',
-    'hypertension': 'Hypertension',
-    'ckd': 'Chronic Kidney Disease',
-    'pvd': 'Peripheral Vascular Disease',
-    'liver_cirrhosis': 'Liver Cirrhosis',
-    'anemia': 'Anemia',
-}
+PHECODE_INFO_PATH = os.path.join(os.path.dirname(__file__), '..', 'data',
+                                  'mimic_phecode_info.csv')
+COLOR_POS = '#CD5C5C'
 
-COLOR_POS = '#CD5C5C'  # Indian red
+
+def load_phecode_info():
+    """Load phecode -> phenotype name mapping."""
+    if not os.path.exists(PHECODE_INFO_PATH):
+        return {}
+    df = pd.read_csv(PHECODE_INFO_PATH, dtype={'phecode': str})
+    return dict(zip(df['phecode'], df['phenotype']))
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +140,9 @@ def load_per_seed_importance(results_dir, concepts, concept_embeddings):
         model.load_state_dict(ckpt['state_dict'])
         model = model.to(device)
 
-        # [n_labels, emb_dim]
         weights = model.linear.weight.detach()
         weights_norm = torch.nn.functional.normalize(weights, dim=1)
 
-        # Cosine similarity: [n_concepts, n_labels]
         importance = torch.matmul(concept_embeddings_norm, weights_norm.T)
         all_importance.append(importance.cpu().numpy())
 
@@ -182,6 +157,17 @@ def load_per_seed_importance(results_dir, concepts, concept_embeddings):
     print(f"Computed importance: {all_importance.shape[0]} seeds, "
           f"{all_importance.shape[1]} concepts, {all_importance.shape[2]} labels")
     return avg, std, all_importance, labels
+
+
+def load_summary_aucs(results_dir):
+    """Load per-label AUCs from summary JSON."""
+    pattern = os.path.join(results_dir, "summary_*.json")
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        return {}
+    with open(paths[-1]) as f:
+        summary = json.load(f)
+    return summary.get('per_label_stats', {})
 
 
 # ---------------------------------------------------------------------------
@@ -200,13 +186,14 @@ def wrap_label(text, max_words=5):
 
 
 def plot_single_label(avg_weights, std_weights, all_weights, concepts,
-                      label, label_idx, top_k=10, output_dir=None):
-    """Create a horizontal bar chart for one phenotype with error bars and seed points."""
+                      label, label_idx, top_k=10, output_dir=None,
+                      phecode_names=None):
+    """Create a horizontal bar chart for one phenotype."""
+    phecode_names = phecode_names or {}
     label_avg = avg_weights[:, label_idx]
     label_std = std_weights[:, label_idx]
     label_all = all_weights[:, :, label_idx]  # [n_seeds, n_concepts]
 
-    # Get top-k positive concepts
     df = pd.DataFrame({
         'concept': concepts,
         'weight': label_avg,
@@ -216,7 +203,6 @@ def plot_single_label(avg_weights, std_weights, all_weights, concepts,
     df_pos = df[df['weight'] > 0].sort_values('weight', ascending=False).head(top_k)
 
     if len(df_pos) == 0:
-        print(f"  {label}: no positive concepts, skipping")
         return
 
     combined_concepts = df_pos['concept'].tolist()
@@ -224,15 +210,13 @@ def plot_single_label(avg_weights, std_weights, all_weights, concepts,
     combined_stds = df_pos['std'].tolist()
     combined_indices = df_pos['concept_idx'].tolist()
 
-    # Create figure
     fig, ax = plt.subplots(figsize=(13, 12))
 
     y_positions = list(range(len(combined_weights)))
-    bars = ax.barh(y_positions, combined_weights, xerr=combined_stds,
-                   color=COLOR_POS, alpha=0.8, edgecolor='black', linewidth=1,
-                   capsize=0, error_kw={'linewidth': 1.5, 'alpha': 0.8})
+    ax.barh(y_positions, combined_weights, xerr=combined_stds,
+            color=COLOR_POS, alpha=0.8, edgecolor='black', linewidth=1,
+            capsize=0, error_kw={'linewidth': 1.5, 'alpha': 0.8})
 
-    # Individual seed data points as open circles
     rng = np.random.RandomState(42)
     for i, c_idx in enumerate(combined_indices):
         seed_values = label_all[:, c_idx]
@@ -241,7 +225,6 @@ def plot_single_label(avg_weights, std_weights, all_weights, concepts,
                    s=30, facecolors='none', edgecolors='black',
                    alpha=0.6, linewidth=1)
 
-    # Labels
     clean_labels = [wrap_label(c) for c in combined_concepts]
     ax.set_yticks(y_positions)
     ax.set_yticklabels(clean_labels, fontsize=18)
@@ -249,7 +232,6 @@ def plot_single_label(avg_weights, std_weights, all_weights, concepts,
     ax.set_xlabel('Concept importance score', fontsize=28)
     ax.invert_yaxis()
 
-    # Adaptive x-axis: zoom to range of plotted data
     all_vals = combined_weights.copy()
     for c_idx in combined_indices:
         all_vals.extend(label_all[:, c_idx].tolist())
@@ -262,18 +244,17 @@ def plot_single_label(avg_weights, std_weights, all_weights, concepts,
     ax.spines['right'].set_visible(False)
     ax.grid(True, alpha=0.3, axis='x')
 
-    display = LABEL_DISPLAY.get(label, label)
+    display = phecode_names.get(label, label)
     ax.set_title(display, fontsize=32, pad=10)
 
     plt.tight_layout()
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        safe = label.replace(' ', '_')
+        safe = label.replace('.', '_').replace(' ', '_')
         for ext in ['png', 'pdf']:
             path = os.path.join(output_dir, f"concept_importance_{safe}.{ext}")
             fig.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
-        print(f"  Saved: concept_importance_{safe}.{{png,pdf}}")
     plt.close(fig)
 
 
@@ -282,19 +263,21 @@ def plot_single_label(avg_weights, std_weights, all_weights, concepts,
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description='Plot concept importance for MIMIC phenotype linear probes')
+        description='Plot concept importance for MIMIC PheWAS phenotype linear probes')
     parser.add_argument(
         '--results_dir', type=str,
         default=os.path.join(os.path.dirname(__file__),
                              'results', 'linear_mimic_kalm_gemma3_12b'),
         help='Linear probing results directory')
-    parser.add_argument('--labels', nargs='+', default=None,
-                        help='Specific labels to plot (default: core phenotypes)')
-    parser.add_argument('--all_labels', action='store_true',
-                        help='Plot all labels')
+    parser.add_argument('--phecodes', nargs='+', default=None,
+                        help='Specific phecodes to plot')
+    parser.add_argument('--n_phenotypes', type=int, default=20,
+                        help='Number of top phenotypes to plot (by AUC)')
     parser.add_argument('--top_k', type=int, default=10,
-                        help='Number of top positive concepts to show')
+                        help='Number of top positive concepts to show per phenotype')
     args = parser.parse_args()
+
+    phecode_names = load_phecode_info()
 
     # Detect embedding model
     model_key = detect_embedding_model(args.results_dir)
@@ -307,24 +290,33 @@ def main():
     avg_weights, std_weights, all_weights, labels = load_per_seed_importance(
         args.results_dir, concepts, concept_embeddings)
 
-    # Determine which labels to plot
-    eval_labels = [l for l in labels if l not in SKIP_EVAL_LABELS]
-    if args.all_labels:
-        plot_labels = eval_labels
-    elif args.labels:
-        plot_labels = [l for l in args.labels if l in eval_labels]
-    else:
-        plot_labels = [l for l in CORE_PHENOTYPES if l in eval_labels]
+    # Load AUCs to select top phenotypes
+    per_label_stats = load_summary_aucs(args.results_dir)
 
-    print(f"\nPlotting {len(plot_labels)} labels: {plot_labels}")
+    # Determine which labels to plot
+    if args.phecodes:
+        plot_labels = [l for l in args.phecodes if l in labels]
+    else:
+        # Top phenotypes by AUC
+        sorted_by_auc = sorted(
+            per_label_stats.items(),
+            key=lambda x: x[1]['mean'],
+            reverse=True,
+        )
+        plot_labels = [pc for pc, _ in sorted_by_auc[:args.n_phenotypes]
+                       if pc in labels]
+
+    print(f"\nPlotting {len(plot_labels)} phenotypes")
 
     output_dir = os.path.join(args.results_dir, 'concept_importance', 'plots')
 
     for label in plot_labels:
         label_idx = labels.index(label)
+        name = phecode_names.get(label, label)
+        print(f"  {label} ({name[:40]})")
         plot_single_label(avg_weights, std_weights, all_weights, concepts,
                           label, label_idx, top_k=args.top_k,
-                          output_dir=output_dir)
+                          output_dir=output_dir, phecode_names=phecode_names)
 
     print(f"\nAll plots saved to {output_dir}/")
 

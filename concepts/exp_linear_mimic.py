@@ -69,6 +69,25 @@ DATASET_CONFIGS = {
         'image_id_col': 'dicom_id',
         'patient_id_col': 'subject_id',
         'val_split_name': 'validate',
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_validate.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_test.h5'),
+        },
+    },
+    'mimic63': {
+        'default_labels': os.path.join(_DATA_ROOT, 'mimic_63label_labels.parquet'),
+        'meta_columns': {'dicom_id', 'subject_id', 'study_id', 'split',
+                         'ViewPosition', 'icd_source'},
+        'image_id_col': 'dicom_id',
+        'patient_id_col': 'subject_id',
+        'val_split_name': 'validate',
+        'cache_prefix': 'mimic',   # same images/splits as mimic, reuse cache
+        'default_h5': {
+            'train': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_train.h5'),
+            'val': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_validate.h5'),
+            'test': os.path.join(_DATA_ROOT, 'h5_1024', 'mimic_test.h5'),
+        },
     },
     'padchest': {
         'default_labels': os.path.join(_DATA_ROOT, 'padchest_labels.csv'),
@@ -145,8 +164,8 @@ EMBEDDING_MODELS = {
 }
 
 # Training hyperparameters
-LR = 2e-4
-WEIGHT_DECAY = 1e-8
+LR = 1e-2
+WEIGHT_DECAY = 0
 MAX_EPOCHS = 200
 PATIENCE = 10
 TRAIN_BATCH_SIZE = 512
@@ -656,25 +675,48 @@ def run_linear_probing_pipeline(args):
     val_df, val_labels, _ = splits['validate']
     test_df, test_labels, _ = splits['test']
 
-    # Step 2: Load CLIP model
-    print("\n[Step 2/7] Loading ViT-7B LoRA CLIP model...")
-    clip_model = load_clip_model(args.model_path, merge_lora=args.merge_lora)
-
     # Step 3: Load concepts
     print("\n[Step 3/7] Loading concepts...")
     concepts, concept_indices = load_concepts(
         max_concepts=args.max_concepts)
 
+    # Check if all caches exist (image features + concept features)
+    feature_cache_dir = os.path.join(os.path.dirname(__file__), 'cache')
+    os.makedirs(feature_cache_dir, exist_ok=True)
+    tag = get_cache_tag(args.model_path)
+    cache_dataset = DATASET_CONFIGS[dataset].get('cache_prefix', dataset)
+    concept_cache_path = os.path.join(feature_cache_dir,
+                                      f"concept_features_{tag}.pt")
+    image_cache_paths = {
+        s: os.path.join(feature_cache_dir, f"{cache_dataset}_{s}_{tag}.pt")
+        for s in ['train', 'validate', 'test']
+    }
+    all_cached = (not args.no_cache
+                  and os.path.exists(concept_cache_path)
+                  and all(os.path.exists(p) for p in image_cache_paths.values()))
+
+    if all_cached:
+        print("\n[Step 2/7] Skipping CLIP model load (all features cached)")
+        clip_model = None
+    else:
+        # Step 2: Load CLIP model
+        print("\n[Step 2/7] Loading ViT-7B LoRA CLIP model...")
+        clip_model = load_clip_model(args.model_path, merge_lora=args.merge_lora)
+
     # Step 4: Encode concepts with CLIP text encoder
     print("\n[Step 4/7] Encoding concepts with CLIP text encoder...")
-    concept_features = encode_concepts_clip(clip_model, concepts,
-                                             batch_size=args.concept_batch_size)
+    if os.path.exists(concept_cache_path) and not args.no_cache:
+        print(f"  Loading cached concept features from {concept_cache_path}")
+        concept_features = torch.load(concept_cache_path, weights_only=True)
+    else:
+        concept_features = encode_concepts_clip(clip_model, concepts,
+                                                 batch_size=args.concept_batch_size)
+        torch.save(concept_features, concept_cache_path)
+        print(f"  Cached to {concept_cache_path}")
     print(f"  Concept features: {concept_features.shape}")
 
     # Step 5: Encode images for all splits
     print("\n[Step 5/7] Encoding images for all splits...")
-    feature_cache_dir = os.path.join(os.path.dirname(__file__), 'cache')
-    os.makedirs(feature_cache_dir, exist_ok=True)
 
     # Map split names to per-split H5 paths (if provided)
     h5_split_paths = {
@@ -691,9 +733,7 @@ def run_linear_probing_pipeline(args):
     image_features = {}
 
     for split_name, (split_df, _) in splits_data.items():
-        tag = get_cache_tag(args.model_path)
-        cache_path = os.path.join(feature_cache_dir,
-                                  f"{dataset}_{split_name}_{tag}.pt")
+        cache_path = image_cache_paths[split_name]
         if os.path.exists(cache_path) and not args.no_cache:
             print(f"  Loading cached {split_name} features from {cache_path}")
             image_features[split_name] = torch.load(cache_path,
@@ -712,11 +752,16 @@ def run_linear_probing_pipeline(args):
             print(f"  Cached to {cache_path}")
 
     # Free CLIP model
-    print("\n  Freeing CLIP model from GPU...")
-    del clip_model
+    if clip_model is not None:
+        print("\n  Freeing CLIP model from GPU...")
+        del clip_model
     torch.cuda.empty_cache()
     gc.collect()
     print_gpu_memory("after freeing CLIP")
+
+    if args.cache_only:
+        print("\n[cache_only] Features cached. Exiting before linear probing.")
+        return
 
     # Step 6-7: For each embedding model, project & train linear probe
     output_dir = os.path.join(os.path.dirname(__file__), 'results')
@@ -947,6 +992,8 @@ def parse_args():
                         action='store_false')
     parser.add_argument('--no_cache', action='store_true', default=False,
                         help='Disable feature caching')
+    parser.add_argument('--cache_only', action='store_true', default=False,
+                        help='Only extract and cache features, skip linear probing')
 
     args = parser.parse_args()
 
