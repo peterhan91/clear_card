@@ -192,8 +192,8 @@ EMBEDDING_MODELS = {
 }
 
 # Training hyperparameters
-LR = 1e-2
-WEIGHT_DECAY = 0
+LR = 1e-3
+WEIGHT_DECAY = 1e-8
 MAX_EPOCHS = 200
 PATIENCE = 10
 TRAIN_BATCH_SIZE = 512
@@ -465,6 +465,7 @@ def load_concept_embeddings(model_key: str, concept_indices: List[int],
             else:
                 embeddings[pos] = np.array(emb, dtype=np.float32)
         else:
+            embeddings[pos] = np.random.randn(dim).astype(np.float32) * 0.01
             missing += 1
 
     if missing:
@@ -534,9 +535,7 @@ def project_to_llm_space(image_features: torch.Tensor,
 
         # Project to LLM space: [batch, emb_dim]
         llm_batch = sim @ ce
-        llm_batch = torch.clamp(llm_batch, min=-1e6, max=1e6)
-        norms = llm_batch.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        llm_batch = llm_batch / norms
+        llm_batch = llm_batch / llm_batch.norm(dim=-1, keepdim=True)
 
         all_repr.append(llm_batch.cpu())
         torch.cuda.empty_cache()
@@ -628,9 +627,13 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
 
         # Validation
         y_true_val, y_pred_val = evaluate_model(lr_model, val_loader, device)
-        val_aucs = compute_aucs(y_true_val, y_pred_val, label_cols,
-                                min_positives=1)
-        val_mean_auc = np.mean(list(val_aucs.values())) if val_aucs else 0.0
+        val_aucs_list = []
+        for i, label in enumerate(label_cols):
+            if len(np.unique(y_true_val[:, i])) > 1:
+                val_aucs_list.append(roc_auc_score(y_true_val[:, i], y_pred_val[:, i]))
+            else:
+                val_aucs_list.append(0.0)
+        val_mean_auc = np.mean(val_aucs_list)
 
         if epoch % 20 == 0 or epoch < 5:
             print(f"  Epoch {epoch + 1:3d}: loss={train_loss:.4f}  "
@@ -1013,7 +1016,7 @@ def parse_args():
                         help='Number of random seeds (default 5)')
     parser.add_argument('--image_batch_size', type=int, default=64,
                         help='Batch size for image encoding')
-    parser.add_argument('--concept_batch_size', type=int, default=512,
+    parser.add_argument('--concept_batch_size', type=int, default=4096,
                         help='Batch size for concept text encoding')
     parser.add_argument('--merge_lora', action='store_true', default=True)
     parser.add_argument('--no_merge_lora', dest='merge_lora',

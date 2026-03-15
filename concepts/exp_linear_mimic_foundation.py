@@ -145,7 +145,7 @@ DATASET_CONFIGS = {
 DEFAULT_MIMIC_JPG_DIR = "/cbica/projects/CXR/data_p/mimic-cxr-jpg/"
 
 # Training hyper-parameters (identical to concept-based linear probing)
-LR = 2e-4
+LR = 1e-3
 WEIGHT_DECAY = 1e-8
 MAX_EPOCHS = 200
 PATIENCE = 10
@@ -603,9 +603,13 @@ def run_single_seed(train_repr, train_labels, val_repr, val_labels,
                            device)
 
         y_t_val, y_p_val = evaluate_model(lr_model, val_loader, device)
-        val_aucs = compute_aucs(y_t_val, y_p_val, label_cols,
-                                min_positives=1)
-        val_mean = np.mean(list(val_aucs.values())) if val_aucs else 0.0
+        val_aucs_list = []
+        for i, label in enumerate(label_cols):
+            if len(np.unique(y_t_val[:, i])) > 1:
+                val_aucs_list.append(roc_auc_score(y_t_val[:, i], y_p_val[:, i]))
+            else:
+                val_aucs_list.append(0.0)
+        val_mean = np.mean(val_aucs_list)
 
         if epoch % 20 == 0 or epoch < 5:
             print(f"  Epoch {epoch + 1:3d}: loss={loss:.4f}  "

@@ -432,6 +432,8 @@ def get_prompt_texts(labels: List[str], phecode_names: dict = None):
     neg_prompts = []
     for label in labels:
         readable = phecode_names.get(label, label.replace('_', ' '))
+        if not isinstance(readable, str) or not readable.strip():
+            readable = label.replace('_', ' ')
         pos_prompts.append(readable)
         neg_prompts.append(f"no {readable}")
     return pos_prompts, neg_prompts

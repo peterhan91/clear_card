@@ -1262,7 +1262,9 @@ def main():
     local_group.add_argument('--trust_remote_code', action='store_true', default=True,
                        help='Trust remote code (default: True)')
     local_group.add_argument('--use_fp16', action='store_true', default=True,
-                       help='Use FP16 for GPU acceleration (default: True)')
+                       help='Use FP16/BF16 for GPU acceleration (default: True)')
+    local_group.add_argument('--no_fp16', dest='use_fp16', action='store_false',
+                       help='Use full FP32 precision (disables FP16/BF16)')
     
     # PCA options
     pca_group = parser.add_argument_group('PCA options')
